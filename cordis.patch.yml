@@ -1,0 +1,54 @@
+# DeepSeekHarness Bundle Patch for External CLI Agent Runtimes (Desktop & Web)
+# Wraps the native AgentLoop so built-in DSH presets keep working normally while
+# adding Codex, Antigravity, ClaudeCode, and TRAE CLI as selectable presets.
+# Does not override user default model, default preset, or session title settings.
+
+- id: agent-loop
+  disabled: true
+
+- insert:
+    - id: preset-codex
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: codex
+        name: Codex
+        description: 通过 codex app-server 接入 OpenAI Codex，擅长仓库级代码工程与长程任务，支持推理强度调节与线程续接
+        order: 10
+        plugins: []
+    - id: preset-agy
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: agy
+        name: Antigravity
+        description: 通过 ACP 协议接入 Antigravity CLI，支持多模型切换与工具协作，适合通用研发与调研
+        order: 11
+        plugins: []
+    - id: preset-claude-code
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: claude-code
+        name: ClaudeCode
+        description: 通过 ACP 适配器接入 Anthropic Claude Code，擅长代码理解、重构与多步骤工程任务
+        order: 12
+        plugins: []
+    - id: preset-trae
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: trae
+        name: TRAE
+        description: 通过 traecli app-server 接入 TRAE CLI，支持多模型切换、推理强度调节与工程协作
+        order: 13
+        plugins: []
+    - id: dsh-external-agents
+      name: 'dsh-external-agents'
+      config:
+        idleEvictMs: 900000
+        runtimes:
+          - id: codex
+            enabled: true
+          - id: agy
+            enabled: true
+          - id: claude-code
+            enabled: true
+          - id: trae
+            enabled: true

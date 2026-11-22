@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "External Agent Runtimes",
+    "description": "Plug external CLI coding agents (Codex, Antigravity, Claude Code, and TRAE CLI) into DeepSeek Harness (Desktop & Web) while keeping all native presets intact."
+  }
+}

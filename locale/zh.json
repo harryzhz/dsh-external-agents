@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "外部 Agent 运行时",
+    "description": "在 DeepSeek Harness（Desktop 与 Web）中按需接入 Codex、Antigravity、Claude Code 与 TRAE CLI 等外部 Agent 运行时，同时完整保留 DSH 原生预设。"
+  }
+}

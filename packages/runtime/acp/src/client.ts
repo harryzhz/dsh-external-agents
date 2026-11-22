@@ -1,0 +1,569 @@
+import { AcpRpcError, isMethodNotFound, isResourceNotFound } from './errors.js'
+import {
+  extractAcpPromptUsage,
+  normalizeAcpPermissionRequest,
+  normalizeAcpSessionUpdate,
+  parseAcpCatalog,
+  parseAcpInitializeResult,
+  pickDefaultAllowOptionId,
+} from './event-normalizer.js'
+import { AcpStdioTransport } from './stdio-transport.js'
+import type {
+  AcpActiveToolCall,
+  AcpAgentCapabilities,
+  AcpCatalogSnapshot,
+  AcpInitializeResult,
+  AcpJsonRpcMessage,
+  AcpJsonRpcTransport,
+  AcpPromptBlock,
+  AcpRuntimeOptions,
+  AcpStartOptions,
+  AcpTokenUsage,
+  AcpTransportFactoryOptions,
+  AcpTurnHandlers,
+  AcpTurnResult,
+} from './types.js'
+
+const DEFAULT_REQUEST_TIMEOUT_MS = 120_000
+/** `initialize` also covers process cold start (e.g. `npx` fetching the agent package). */
+const STARTUP_TIMEOUT_MS = 5 * 60_000
+const PROMPT_TIMEOUT_MS = 30 * 60_000
+
+interface PendingRequest {
+  readonly method: string
+  readonly resolve: (result: unknown) => void
+  readonly reject: (error: Error) => void
+  readonly timer: ReturnType<typeof setTimeout>
+}
+
+interface ActiveTurnContext {
+  text: string
+  usage?: AcpTokenUsage
+  readonly activeTools: Map<string, AcpActiveToolCall>
+  readonly handlers: AcpTurnHandlers
+  readonly abortController: AbortController
+}
+
+interface OpenedSession {
+  readonly sessionId: string
+  readonly result: unknown
+}
+
+/** Generic Agent Client Protocol (ACP) client over a stdio JSON-RPC transport. */
+export class AcpRuntimeClient {
+  private readonly cwd: string
+  private readonly command: string
+  private readonly args: readonly string[]
+  private readonly env: NodeJS.ProcessEnv
+  private readonly label: string
+  private readonly requestTimeoutMs: number
+  private readonly clientName: string
+  private readonly clientVersion: string
+  private readonly logger: (message: string) => void
+  private readonly transportFactory: (options: AcpTransportFactoryOptions) => AcpJsonRpcTransport
+
+  private transport?: AcpJsonRpcTransport
+  private nextId = 1
+  private initResult?: AcpInitializeResult
+  private closed = false
+  private currentSessionId?: string
+  private catalogSnapshot?: AcpCatalogSnapshot
+  private activeTurn?: ActiveTurnContext
+  private readonly pending = new Map<number, PendingRequest>()
+
+  constructor(options: AcpRuntimeOptions) {
+    this.cwd = options.cwd
+    this.command = options.command
+    this.args = options.args
+    this.env = options.env ?? process.env
+    this.label = `acp(${options.command})`
+    this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS
+    this.clientName = options.clientName ?? 'dsh-external-agents'
+    this.clientVersion = options.clientVersion ?? '0.1.0'
+    this.logger = options.logger ?? (() => {})
+    this.transportFactory = options.transportFactory ?? ((opts) => new AcpStdioTransport(opts))
+  }
+
+  get sessionId(): string | undefined {
+    return this.currentSessionId
+  }
+
+  get catalog(): AcpCatalogSnapshot | undefined {
+    return this.catalogSnapshot
+  }
+
+  /** Result of the most recent `initialize` handshake. */
+  get initializeResult(): AcpInitializeResult | undefined {
+    return this.initResult
+  }
+
+  get isConnected(): boolean {
+    return Boolean(this.transport && this.initResult && !this.closed)
+  }
+
+  async initialize(): Promise<AcpInitializeResult> {
+    if (this.initResult && this.transport && !this.closed) return this.initResult
+    this.closed = false
+    const transport = this.transportFactory({
+      command: this.command,
+      args: this.args,
+      cwd: this.cwd,
+      env: this.env,
+    })
+    this.transport = transport
+    transport.onMessage((msg) => this.handleMessage(msg))
+    transport.onClose((err) => this.handleTransportClosed(err))
+
+    const raw = await this.request(
+      'initialize',
+      {
+        protocolVersion: 1,
+        clientCapabilities: {
+          fs: { readTextFile: false, writeTextFile: false },
+          terminal: false,
+        },
+        clientInfo: { name: this.clientName, version: this.clientVersion },
+      },
+      Math.max(this.requestTimeoutMs, STARTUP_TIMEOUT_MS),
+    )
+    this.initResult = parseAcpInitializeResult(raw)
+    return this.initResult
+  }
+
+  /**
+   * Open a session. With `sessionId`, recovery follows negotiated capabilities:
+   * `session/resume` first (unless declared unsupported), then `session/load`
+   * when the agent advertises `loadSession`, otherwise a fresh `session/new`.
+   * The returned id differs from `options.sessionId` only in the last case.
+   */
+  async startOrResume(options: AcpStartOptions = {}): Promise<string> {
+    const init = await this.initialize()
+    const opened = options.sessionId
+      ? await this.restoreSession(options.sessionId, init.agentCapabilities)
+      : await this.newSession()
+    this.currentSessionId = opened.sessionId
+    this.catalogSnapshot = parseAcpCatalog(opened.result)
+
+    const normalized = this.normalizeModelAndThought(options.modelId, options.thoughtLevel)
+    if (normalized.modelId && normalized.modelId !== this.catalogSnapshot.currentModelId) {
+      await this.applyStartModel(normalized.modelId)
+    }
+    if (normalized.thoughtLevel && normalized.thoughtLevel !== this.catalogSnapshot.currentThoughtLevel) {
+      await this.applyStartThoughtLevel(normalized.thoughtLevel)
+    }
+    if (options.modeId && options.modeId !== this.catalogSnapshot.currentModeId) {
+      await this.setMode(options.modeId)
+    }
+    return opened.sessionId
+  }
+
+  async setModel(modelId: string): Promise<void> {
+    if (!this.currentSessionId) return
+    const normalized = this.normalizeModelAndThought(modelId, undefined)
+    const targetModelId = normalized.modelId ?? modelId
+    const configId = this.catalogSnapshot?.modelConfigOptionId
+    if (configId) {
+      const res = await this.request('session/set_config_option', {
+        sessionId: this.currentSessionId,
+        configId,
+        value: targetModelId,
+      })
+      this.mergeConfigOptionsSnapshot(res, { currentModelId: targetModelId })
+      if (normalized.inferredThoughtLevel) {
+        await this.setThoughtLevel(normalized.inferredThoughtLevel)
+      }
+    } else {
+      await this.request('session/set_model', {
+        sessionId: this.currentSessionId,
+        modelId: targetModelId,
+      })
+      if (this.catalogSnapshot) {
+        this.catalogSnapshot = { ...this.catalogSnapshot, currentModelId: targetModelId }
+      }
+    }
+  }
+
+  async setThoughtLevel(thoughtLevel: string): Promise<void> {
+    if (!this.currentSessionId) return
+    const snap = this.catalogSnapshot
+    const configId = snap?.thoughtConfigOptionId
+    if (!configId) return
+
+    const available = snap?.thoughtLevels ?? []
+    let targetValue = thoughtLevel.trim()
+    if (!targetValue) {
+      if (available.some((t) => t.id === 'default')) {
+        targetValue = 'default'
+      } else {
+        const currentModel = snap?.models.find((m) => m.id === snap.currentModelId)
+        targetValue = currentModel?.defaultThoughtLevel ?? ''
+      }
+    }
+    if (!targetValue) return
+    if (available.length > 0 && !available.some((t) => t.id === targetValue)) {
+      this.logger(`${this.label} skipping unsupported thoughtLevel "${targetValue}"`)
+      return
+    }
+    const res = await this.request('session/set_config_option', {
+      sessionId: this.currentSessionId,
+      configId,
+      value: targetValue,
+    })
+    this.mergeConfigOptionsSnapshot(res, { currentThoughtLevel: targetValue })
+  }
+
+  async setMode(modeId: string): Promise<void> {
+    if (!this.currentSessionId) return
+    await this.request('session/set_mode', {
+      sessionId: this.currentSessionId,
+      modeId,
+    })
+    if (this.catalogSnapshot) {
+      this.catalogSnapshot = { ...this.catalogSnapshot, currentModeId: modeId }
+    }
+  }
+
+  async runTurn(
+    prompt: readonly AcpPromptBlock[],
+    handlers: AcpTurnHandlers = {},
+    signal?: AbortSignal,
+  ): Promise<AcpTurnResult> {
+    if (!this.currentSessionId) {
+      throw new Error('AcpRuntimeClient.runTurn called before startOrResume()')
+    }
+    if (this.activeTurn) {
+      throw new Error('AcpRuntimeClient already has an active turn in flight')
+    }
+    if (signal?.aborted) {
+      return { text: '', stopReason: 'cancelled' }
+    }
+
+    const abortController = new AbortController()
+    const turn: ActiveTurnContext = {
+      text: '',
+      activeTools: new Map(),
+      handlers,
+      abortController,
+    }
+    this.activeTurn = turn
+
+    const onExternalAbort = () => {
+      abortController.abort(signal?.reason)
+      this.notify('session/cancel', { sessionId: this.currentSessionId })
+    }
+    signal?.addEventListener('abort', onExternalAbort, { once: true })
+
+    try {
+      const res = (await this.request(
+        'session/prompt',
+        { sessionId: this.currentSessionId, prompt },
+        PROMPT_TIMEOUT_MS,
+      )) as { stopReason?: string; usage?: unknown }
+      const usage = extractAcpPromptUsage(res?.usage) ?? turn.usage
+      if (usage) {
+        try {
+          handlers.onEvent?.({ type: 'usage', usage })
+        } catch {
+          // Isolate callback errors.
+        }
+      }
+      return {
+        text: turn.text,
+        stopReason: res?.stopReason ?? 'end_turn',
+        ...(usage ? { usage } : {}),
+      }
+    } finally {
+      signal?.removeEventListener('abort', onExternalAbort)
+      abortController.abort()
+      if (this.activeTurn === turn) {
+        this.activeTurn = undefined
+      }
+    }
+  }
+
+  async close(): Promise<void> {
+    if (this.closed) return
+    this.closed = true
+    const transport = this.transport
+    this.transport = undefined
+    this.initResult = undefined
+    this.failPending(new Error(`${this.label} runtime closed`))
+    if (transport) {
+      await transport.close()
+    }
+  }
+
+  static async probeCatalog(options: AcpRuntimeOptions): Promise<AcpCatalogSnapshot> {
+    const client = new AcpRuntimeClient(options)
+    try {
+      await client.startOrResume()
+      return client.catalog ?? { models: [], modes: [] }
+    } finally {
+      await client.close()
+    }
+  }
+
+  private async newSession(): Promise<OpenedSession> {
+    const res = (await this.request('session/new', {
+      cwd: this.cwd,
+      mcpServers: [],
+    })) as { sessionId?: unknown } | undefined
+    if (typeof res?.sessionId !== 'string' || res.sessionId.length === 0) {
+      throw new Error(`${this.label} session/new returned no sessionId`)
+    }
+    return { sessionId: res.sessionId, result: res }
+  }
+
+  private async restoreSession(
+    sessionId: string,
+    capabilities: AcpAgentCapabilities,
+  ): Promise<OpenedSession> {
+    const params = { sessionId, cwd: this.cwd, mcpServers: [] }
+    try {
+      if (capabilities.resume !== 'unsupported') {
+        try {
+          return { sessionId, result: await this.request('session/resume', params) }
+        } catch (err) {
+          if (!isMethodNotFound(err)) throw err
+          this.logger(`${this.label} does not implement session/resume; trying fallback`)
+        }
+      }
+      if (capabilities.loadSession) {
+        // History replayed via session/update while loading is dropped: no active turn yet.
+        return { sessionId, result: await this.request('session/load', params) }
+      }
+      this.logger(`${this.label} cannot restore session ${sessionId}; starting a new session`)
+    } catch (err) {
+      // The agent no longer knows this session (e.g. it was never persisted because
+      // the first prompt failed). Start over instead of failing every later turn.
+      if (!isResourceNotFound(err)) throw err
+      this.logger(`${this.label} session ${sessionId} not found; starting a new session`)
+    }
+    return await this.newSession()
+  }
+
+  private normalizeModelAndThought(
+    rawModelId?: string,
+    rawThoughtLevel?: string,
+  ): { modelId?: string; thoughtLevel?: string; inferredThoughtLevel?: string } {
+    const trimmedModel = rawModelId?.trim() || undefined
+    const trimmedThought = rawThoughtLevel?.trim() || undefined
+    const snap = this.catalogSnapshot
+    if (!trimmedModel || !snap?.modelConfigOptionId || snap.models.length === 0) {
+      return {
+        ...(trimmedModel ? { modelId: trimmedModel } : {}),
+        ...(trimmedThought ? { thoughtLevel: trimmedThought } : {}),
+      }
+    }
+    if (snap.models.some((m) => m.id === trimmedModel)) {
+      return {
+        modelId: trimmedModel,
+        ...(trimmedThought ? { thoughtLevel: trimmedThought } : {}),
+      }
+    }
+    const match = /^(.*)-(low|medium|high|xhigh|max|ultra)$/i.exec(trimmedModel)
+    if (match) {
+      const baseId = match[1]!
+      const suffix = match[2]!.toLowerCase()
+      if (snap.models.some((m) => m.id === baseId)) {
+        return {
+          modelId: baseId,
+          thoughtLevel: trimmedThought ?? suffix,
+          inferredThoughtLevel: trimmedThought ?? suffix,
+        }
+      }
+    }
+    return {
+      modelId: trimmedModel,
+      ...(trimmedThought ? { thoughtLevel: trimmedThought } : {}),
+    }
+  }
+
+  private mergeConfigOptionsSnapshot(
+    rawResult: unknown,
+    fallbackPatch: Partial<AcpCatalogSnapshot>,
+  ): void {
+    if (!this.catalogSnapshot) return
+    if (
+      rawResult &&
+      typeof rawResult === 'object' &&
+      Array.isArray((rawResult as Record<string, unknown>).configOptions)
+    ) {
+      const updated = parseAcpCatalog(rawResult)
+      // Preserve per-model thoughtLevels metadata parsed from initial session/new
+      const mergedModels =
+        updated.models.length > 0
+          ? updated.models.map((m) => {
+              const prev = this.catalogSnapshot?.models.find((pm) => pm.id === m.id)
+              return prev?.thoughtLevels ? { ...m, thoughtLevels: prev.thoughtLevels, ...(prev.defaultThoughtLevel ? { defaultThoughtLevel: prev.defaultThoughtLevel } : {}) } : m
+            })
+          : this.catalogSnapshot.models
+      this.catalogSnapshot = {
+        ...this.catalogSnapshot,
+        ...fallbackPatch,
+        models: mergedModels,
+        thoughtLevels: updated.thoughtLevels,
+        currentModelId: updated.currentModelId ?? fallbackPatch.currentModelId ?? this.catalogSnapshot.currentModelId,
+        currentThoughtLevel: updated.currentThoughtLevel ?? fallbackPatch.currentThoughtLevel,
+        thoughtConfigOptionId: updated.thoughtConfigOptionId,
+      }
+      return
+    }
+    this.catalogSnapshot = { ...this.catalogSnapshot, ...fallbackPatch }
+  }
+
+  private async applyStartModel(modelId: string): Promise<void> {
+    const available = this.catalogSnapshot?.models ?? []
+    if (available.length > 0 && !available.some((m) => m.id === modelId)) {
+      this.logger(`${this.label} ignoring unknown modelId "${modelId}"`)
+      return
+    }
+    try {
+      await this.setModel(modelId)
+    } catch (err) {
+      this.logger(
+        `${this.label} session/set_model(${modelId}) failed: ${err instanceof Error ? err.message : String(err)}`,
+      )
+    }
+  }
+
+  private async applyStartThoughtLevel(thoughtLevel: string): Promise<void> {
+    try {
+      await this.setThoughtLevel(thoughtLevel)
+    } catch (err) {
+      this.logger(
+        `${this.label} session/set_config_option(thought_level=${thoughtLevel}) failed: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      )
+    }
+  }
+
+  private request(method: string, params: unknown, timeoutMs = this.requestTimeoutMs): Promise<unknown> {
+    if (!this.transport || this.closed) {
+      return Promise.reject(new Error(`cannot send ${this.label} RPC "${method}": transport closed`))
+    }
+    const id = this.nextId++
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (!this.pending.delete(id)) return
+        reject(new Error(`${this.label} RPC "${method}" timed out after ${timeoutMs}ms`))
+      }, timeoutMs)
+      timer.unref?.()
+      this.pending.set(id, { method, resolve, reject, timer })
+      try {
+        this.transport!.send({ jsonrpc: '2.0', id, method, params })
+      } catch (err) {
+        clearTimeout(timer)
+        this.pending.delete(id)
+        reject(err instanceof Error ? err : new Error(String(err)))
+      }
+    })
+  }
+
+  private notify(method: string, params: unknown): void {
+    try {
+      this.transport?.send({ jsonrpc: '2.0', method, params })
+    } catch {
+      // Transport closed.
+    }
+  }
+
+  private respond(id: number | string, result: unknown): void {
+    try {
+      this.transport?.send({ jsonrpc: '2.0', id, result })
+    } catch {
+      // Transport closed.
+    }
+  }
+
+  private handleMessage(msg: AcpJsonRpcMessage): void {
+    if (typeof msg.id === 'number' && !msg.method) {
+      const pending = this.pending.get(msg.id)
+      if (!pending) return
+      this.pending.delete(msg.id)
+      clearTimeout(pending.timer)
+      if (msg.error) {
+        pending.reject(new AcpRpcError(pending.method, msg.error))
+      } else {
+        pending.resolve(msg.result)
+      }
+      return
+    }
+
+    if (msg.id !== undefined && typeof msg.method === 'string') {
+      void this.handleServerRequest(msg.id, msg.method, msg.params)
+      return
+    }
+
+    if (msg.method === 'session/update') {
+      this.handleSessionUpdate(msg.params)
+    }
+  }
+
+  private async handleServerRequest(
+    id: number | string,
+    method: string,
+    params: unknown,
+  ): Promise<void> {
+    if (method !== 'session/request_permission') {
+      this.respond(id, {})
+      return
+    }
+
+    const request = normalizeAcpPermissionRequest(params)
+    const turn = this.activeTurn
+    const handler = turn?.handlers.onPermission
+    if (!handler) {
+      const optionId = pickDefaultAllowOptionId(request.options)
+      this.respond(
+        id,
+        optionId ? { outcome: { outcome: 'selected', optionId } } : { outcome: { outcome: 'cancelled' } },
+      )
+      return
+    }
+
+    try {
+      const outcome = await handler(request, turn.abortController.signal)
+      if (!this.closed) {
+        this.respond(id, { outcome })
+      }
+    } catch {
+      if (!this.closed) {
+        this.respond(id, { outcome: { outcome: 'cancelled' } })
+      }
+    }
+  }
+
+  private handleSessionUpdate(params: unknown): void {
+    const turn = this.activeTurn
+    if (!turn) return
+    const events = normalizeAcpSessionUpdate(params, turn.activeTools)
+    for (const event of events) {
+      if (event.type === 'text-delta') {
+        turn.text += event.text
+      } else if (event.type === 'usage') {
+        turn.usage = event.usage
+      }
+      try {
+        turn.handlers.onEvent?.(event)
+      } catch (err) {
+        this.logger(`${this.label} event handler threw: ${err instanceof Error ? err.message : String(err)}`)
+      }
+    }
+  }
+
+  private handleTransportClosed(error?: Error): void {
+    this.initResult = undefined
+    this.transport = undefined
+    this.failPending(error ?? new Error(`${this.label} transport closed`))
+  }
+
+  private failPending(error: Error): void {
+    for (const [id, pending] of this.pending) {
+      clearTimeout(pending.timer)
+      this.pending.delete(id)
+      pending.reject(error)
+    }
+  }
+}

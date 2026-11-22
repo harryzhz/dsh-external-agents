@@ -1,0 +1,765 @@
+import { describe, expect, it, vi } from 'vitest'
+import {
+  AcpRpcError,
+  AcpRuntimeClient,
+  normalizeAcpPermissionRequest,
+  normalizeAcpSessionUpdate,
+  stripSshSessionEnv,
+  type AcpActiveToolCall,
+  type AcpJsonRpcMessage,
+  type AcpJsonRpcTransport,
+  type AcpTurnEvent,
+} from '../src/index.js'
+
+class MockAcpTransport implements AcpJsonRpcTransport {
+  readonly sent: AcpJsonRpcMessage[] = []
+  private readonly msgListeners = new Set<(m: AcpJsonRpcMessage) => void>()
+  private readonly closeListeners = new Set<(e?: Error) => void>()
+  closed = false
+
+  constructor(private readonly onSend?: (msg: AcpJsonRpcMessage, transport: MockAcpTransport) => void) {}
+
+  send(message: AcpJsonRpcMessage): void {
+    this.sent.push(message)
+    this.onSend?.(message, this)
+  }
+
+  emit(message: AcpJsonRpcMessage): void {
+    for (const l of this.msgListeners) l(message)
+  }
+
+  emitClose(error?: Error): void {
+    this.closed = true
+    for (const l of this.closeListeners) l(error)
+  }
+
+  onMessage(listener: (message: AcpJsonRpcMessage) => void): () => void {
+    this.msgListeners.add(listener)
+    return () => this.msgListeners.delete(listener)
+  }
+
+  onClose(listener: (error?: Error) => void): () => void {
+    this.closeListeners.add(listener)
+    return () => this.closeListeners.delete(listener)
+  }
+
+  async close(): Promise<void> {
+    this.closed = true
+  }
+}
+
+describe('stripSshSessionEnv', () => {
+  it('strips SSH session variables while preserving SSH_AUTH_SOCK', () => {
+    const env = stripSshSessionEnv({
+      PATH: '/usr/bin',
+      SSH_CONNECTION: '127.0.0.1 0 127.0.0.1 0',
+      SSH_CLIENT: '127.0.0.1 0 22',
+      SSH_TTY: '/dev/ttys001',
+      SSH_AUTH_SOCK: '/private/tmp/auth.sock',
+    })
+    expect(env.SSH_CONNECTION).toBeUndefined()
+    expect(env.SSH_CLIENT).toBeUndefined()
+    expect(env.SSH_TTY).toBeUndefined()
+    expect(env.SSH_AUTH_SOCK).toBe('/private/tmp/auth.sock')
+    expect(env.PATH).toBe('/usr/bin')
+  })
+})
+
+describe('AcpRuntimeClient', () => {
+  it('handles session/new, streaming thought/tool/text, permission request, and final usage', async () => {
+    const serverResponses: AcpJsonRpcMessage[] = []
+    let capturedEnv: NodeJS.ProcessEnv | undefined
+
+    const transport = new MockAcpTransport((msg, t) => {
+      if (msg.id !== undefined && !msg.method) {
+        serverResponses.push(msg)
+        return
+      }
+      if (msg.method === 'initialize') {
+        t.emit({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1 } })
+      } else if (msg.method === 'session/new') {
+        t.emit({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            sessionId: 'acp_s1',
+            models: {
+              currentModelId: 'gemini-4-neon-high',
+              availableModels: [
+                { modelId: 'gemini-4-neon-high', name: 'Gemini 4 Neon (High)' },
+                { modelId: 'gemini-4-neon-xhigh', name: 'Gemini 4 Neon (XHigh)' },
+              ],
+            },
+            modes: {
+              currentModeId: 'default',
+              availableModes: [{ id: 'default', name: 'Default' }, { id: 'auto', name: 'Auto' }],
+            },
+          },
+        })
+      } else if (msg.method === 'session/set_model') {
+        t.emit({ jsonrpc: '2.0', id: msg.id, result: {} })
+      } else if (msg.method === 'session/prompt') {
+        queueMicrotask(() => {
+          t.emit({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'acp_s1',
+              update: { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'checking' } },
+            },
+          })
+          t.emit({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'acp_s1',
+              update: { sessionUpdate: 'tool_call', toolCallId: 'tc_1', name: 'run_command', args: { cmd: 'ls' } },
+            },
+          })
+          t.emit({
+            jsonrpc: '2.0',
+            id: 77,
+            method: 'session/request_permission',
+            params: {
+              sessionId: 'acp_s1',
+              toolCall: { toolCallId: 'tc_1', name: 'run_command', title: 'Run ls' },
+              options: [
+                { optionId: 'allow_once', name: 'Allow once', kind: 'allow_once' },
+                { optionId: 'reject_once', name: 'Reject', kind: 'reject_once' },
+              ],
+            },
+          })
+          setTimeout(() => {
+            t.emit({
+              jsonrpc: '2.0',
+              method: 'session/update',
+              params: {
+                sessionId: 'acp_s1',
+                update: {
+                  sessionUpdate: 'tool_call_update',
+                  toolCallId: 'tc_1',
+                  status: 'completed',
+                  rawOutput: 'file.ts',
+                },
+              },
+            })
+            t.emit({
+              jsonrpc: '2.0',
+              method: 'session/update',
+              params: {
+                sessionId: 'acp_s1',
+                update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Found file.ts' } },
+              },
+            })
+            t.emit({
+              jsonrpc: '2.0',
+              id: msg.id,
+              result: {
+                stopReason: 'end_turn',
+                usage: { inputTokens: 200, outputTokens: 30, thoughtTokens: 12, totalTokens: 230 },
+              },
+            })
+          }, 10)
+        })
+      }
+    })
+
+    let capturedLaunch: { command: string; args: readonly string[] } | undefined
+    const client = new AcpRuntimeClient({
+      command: 'agent-cli',
+      args: ['acp', '--stdio'],
+      cwd: '/repo',
+      env: { SSH_AUTH_SOCK: '/sock' },
+      transportFactory: (opts) => {
+        capturedEnv = opts.env
+        capturedLaunch = { command: opts.command, args: opts.args }
+        return transport
+      },
+    })
+
+    const sid = await client.startOrResume({ modelId: 'gemini-4-neon-xhigh' })
+    expect(sid).toBe('acp_s1')
+    expect(capturedLaunch).toEqual({ command: 'agent-cli', args: ['acp', '--stdio'] })
+    expect(capturedEnv).toEqual({ SSH_AUTH_SOCK: '/sock' })
+    expect(client.catalog?.models).toHaveLength(2)
+    expect(transport.sent.find((m) => m.method === 'session/set_model')?.params).toEqual({
+      sessionId: 'acp_s1',
+      modelId: 'gemini-4-neon-xhigh',
+    })
+
+    const events: AcpTurnEvent[] = []
+    const onPermission = vi.fn().mockResolvedValue({ outcome: 'selected', optionId: 'allow_once' })
+    const res = await client.runTurn(
+      [{ type: 'text', text: 'list files' }],
+      { onEvent: (ev) => events.push(ev), onPermission },
+    )
+
+    expect(onPermission).toHaveBeenCalledTimes(1)
+    expect(serverResponses).toContainEqual({
+      jsonrpc: '2.0',
+      id: 77,
+      result: { outcome: { outcome: 'selected', optionId: 'allow_once' } },
+    })
+    expect(res.text).toBe('Found file.ts')
+    expect(res.usage).toEqual({
+      inputTokens: 200,
+      outputTokens: 30,
+      reasoningTokens: 12,
+      totalTokens: 230,
+    })
+    expect(events.map((e) => e.type)).toEqual([
+      'reasoning-delta',
+      'tool-start',
+      'tool-complete',
+      'text-delta',
+      'usage',
+    ])
+    await client.close()
+  })
+
+  it('sends session/cancel when AbortSignal fires and surfaces RPC errors explicitly', async () => {
+    let cancelSent = false
+    const transport = new MockAcpTransport((msg, t) => {
+      if (msg.method === 'initialize') t.emit({ jsonrpc: '2.0', id: msg.id, result: {} })
+      else if (msg.method === 'session/resume') t.emit({ jsonrpc: '2.0', id: msg.id, result: {} })
+      else if (msg.method === 'session/cancel') {
+        cancelSent = true
+      } else if (msg.method === 'session/prompt') {
+        setTimeout(() => {
+          t.emit({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'cancelled' } })
+        }, 20)
+      }
+    })
+
+    const client = new AcpRuntimeClient({ cwd: '/repo', command: 'agent', args: [], transportFactory: () => transport })
+    await client.startOrResume({ sessionId: 'acp_existing' })
+
+    const ac = new AbortController()
+    const promise = client.runTurn([{ type: 'text', text: 'long task' }], {}, ac.signal)
+    ac.abort()
+    const res = await promise
+    expect(cancelSent).toBe(true)
+    expect(res.stopReason).toBe('cancelled')
+    await client.close()
+  })
+})
+
+describe('AcpRuntimeClient session recovery', () => {
+  type Reply = { result: unknown } | { error: { code: number; message: string } }
+
+  function recoveryTransport(
+    agentCapabilities: Record<string, unknown>,
+    replies: Partial<Record<'session/resume' | 'session/load' | 'session/new', Reply>>,
+    onLoad?: (t: MockAcpTransport) => void,
+  ): MockAcpTransport {
+    return new MockAcpTransport((msg, t) => {
+      if (msg.method === 'initialize') {
+        t.emit({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1, agentCapabilities } })
+        return
+      }
+      const reply = replies[msg.method as keyof typeof replies]
+      if (!reply) return
+      if (msg.method === 'session/load') onLoad?.(t)
+      t.emit({ jsonrpc: '2.0', id: msg.id, ...reply })
+    })
+  }
+
+  function methodsSent(transport: MockAcpTransport): string[] {
+    return transport.sent.map((m) => m.method).filter((m): m is string => Boolean(m))
+  }
+
+  it('falls back from session/resume to session/load on method-not-found and ignores replayed history', async () => {
+    const transport = recoveryTransport(
+      { loadSession: true },
+      {
+        'session/resume': { error: { code: -32601, message: 'Method not found' } },
+        'session/load': {
+          result: { models: { currentModelId: 'opus', availableModels: [{ modelId: 'opus', name: 'Opus' }] } },
+        },
+      },
+      (t) => {
+        // History replay emitted during session/load must not leak into a later turn.
+        t.emit({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: 'acp_old',
+            update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'old reply' } },
+          },
+        })
+      },
+    )
+    const logs: string[] = []
+    const client = new AcpRuntimeClient({
+      cwd: '/repo',
+      command: 'agent',
+      args: [],
+      logger: (m) => logs.push(m),
+      transportFactory: () => transport,
+    })
+
+    const sid = await client.startOrResume({ sessionId: 'acp_old' })
+
+    expect(sid).toBe('acp_old')
+    expect(methodsSent(transport)).toEqual(['initialize', 'session/resume', 'session/load'])
+    expect(transport.sent.find((m) => m.method === 'session/load')?.params).toEqual({
+      sessionId: 'acp_old',
+      cwd: '/repo',
+      mcpServers: [],
+    })
+    expect(client.catalog?.currentModelId).toBe('opus')
+    expect(client.initializeResult?.agentCapabilities).toEqual({
+      loadSession: true,
+      resume: 'unknown',
+      promptImage: false,
+    })
+    expect(logs.some((m) => m.includes('session/resume'))).toBe(true)
+    await client.close()
+  })
+
+  it('skips session/resume when capabilities declare it unsupported and starts a new session without loadSession', async () => {
+    const transport = recoveryTransport(
+      { loadSession: false, sessionCapabilities: { list: {} } },
+      { 'session/new': { result: { sessionId: 'acp_fresh' } } },
+    )
+    const client = new AcpRuntimeClient({ cwd: '/repo', command: 'agent', args: [], transportFactory: () => transport })
+
+    const sid = await client.startOrResume({ sessionId: 'acp_old' })
+
+    expect(sid).toBe('acp_fresh')
+    expect(client.sessionId).toBe('acp_fresh')
+    expect(methodsSent(transport)).toEqual(['initialize', 'session/new'])
+    await client.close()
+  })
+
+  it('starts a new session when the agent reports the session as not found', async () => {
+    const transport = recoveryTransport(
+      { loadSession: true, sessionCapabilities: { resume: {} } },
+      {
+        'session/resume': { error: { code: -32002, message: 'Resource not found' } },
+        'session/new': { result: { sessionId: 'acp_new' } },
+      },
+    )
+    const client = new AcpRuntimeClient({ cwd: '/repo', command: 'agent', args: [], transportFactory: () => transport })
+
+    const sid = await client.startOrResume({ sessionId: 'acp_gone' })
+
+    expect(sid).toBe('acp_new')
+    expect(methodsSent(transport)).toEqual(['initialize', 'session/resume', 'session/new'])
+    await client.close()
+  })
+
+  it('propagates other resume errors with their JSON-RPC code instead of silently falling back', async () => {
+    const transport = recoveryTransport(
+      { loadSession: true, sessionCapabilities: { resume: {} } },
+      { 'session/resume': { error: { code: -32603, message: 'Internal error' } } },
+    )
+    const client = new AcpRuntimeClient({ cwd: '/repo', command: 'agent', args: [], transportFactory: () => transport })
+
+    const err = await client.startOrResume({ sessionId: 'acp_old' }).catch((e: unknown) => e)
+
+    expect(err).toBeInstanceOf(AcpRpcError)
+    expect(err).toMatchObject({ code: -32603, method: 'session/resume', message: 'Internal error' })
+    expect(methodsSent(transport)).toEqual(['initialize', 'session/resume'])
+    await client.close()
+  })
+})
+
+describe('AcpRuntimeClient model config options', () => {
+  it('reads models from configOptions and switches them via session/set_config_option', async () => {
+    const transport = new MockAcpTransport((msg, t) => {
+      if (msg.method === 'initialize') {
+        t.emit({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1, agentCapabilities: {} } })
+      } else if (msg.method === 'session/new') {
+        t.emit({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            sessionId: 'acp_cfg',
+            modes: { currentModeId: 'auto', availableModes: [{ id: 'auto', name: 'Auto' }] },
+            configOptions: [
+              {
+                id: 'model',
+                name: 'Model',
+                category: 'model',
+                type: 'select',
+                currentValue: 'default',
+                options: [
+                  { value: 'default', name: 'Default (recommended)' },
+                  { group: 'more', name: 'More', options: [{ value: 'sonnet', name: 'Sonnet' }] },
+                ],
+              },
+            ],
+          },
+        })
+      } else if (msg.method === 'session/set_config_option') {
+        t.emit({ jsonrpc: '2.0', id: msg.id, result: { configOptions: [] } })
+      }
+    })
+    const client = new AcpRuntimeClient({ cwd: '/repo', command: 'agent', args: [], transportFactory: () => transport })
+
+    await client.startOrResume({ modelId: 'sonnet' })
+
+    expect(client.catalog?.models.map((m) => m.id)).toEqual(['default', 'sonnet'])
+    expect(client.catalog?.modes.map((m) => m.id)).toEqual(['auto'])
+    expect(client.catalog?.currentModelId).toBe('sonnet')
+    expect(transport.sent.find((m) => m.method === 'session/set_config_option')?.params).toEqual({
+      sessionId: 'acp_cfg',
+      configId: 'model',
+      value: 'sonnet',
+    })
+    expect(transport.sent.some((m) => m.method === 'session/set_model')).toBe(false)
+    await client.close()
+  })
+
+  it('extracts per-model thought_level options (Antigravity / ClaudeCode), normalizes legacy model slugs, and sets thought_level', async () => {
+    const transport = new MockAcpTransport((msg, t) => {
+      if (msg.method === 'initialize') {
+        t.emit({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1, agentCapabilities: {} } })
+      } else if (msg.method === 'session/new') {
+        t.emit({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            sessionId: 'acp_agy',
+            models: {
+              currentModelId: 'gemini-4-neon-high',
+              availableModels: [
+                { modelId: 'gemini-4-neon-high', name: 'Gemini 4 Neon (High)' },
+                { modelId: 'gemini-4-neon-xhigh', name: 'Gemini 4 Neon (XHigh)' },
+                { modelId: 'gemini-4-carbon-medium', name: 'Gemini 4 Carbon (Medium)' },
+                { modelId: 'gemini-4-carbon-high', name: 'Gemini 4 Carbon (High)' },
+                { modelId: 'gemini-pro-orchestrator-neon', name: 'Orchestrator (Neon)' },
+              ],
+            },
+            configOptions: [
+              {
+                id: 'model',
+                name: 'Model',
+                category: 'model',
+                type: 'select',
+                currentValue: 'gemini-4-neon',
+                options: [
+                  { value: 'gemini-4-neon', name: 'Gemini 4 Neon' },
+                  { value: 'gemini-4-carbon', name: 'Gemini 4 Carbon' },
+                  { value: 'gemini-pro-orchestrator-neon', name: 'Orchestrator (Neon)' },
+                ],
+              },
+              {
+                id: 'thought_level',
+                name: 'Thinking Level',
+                category: 'thought_level',
+                type: 'select',
+                currentValue: 'high',
+                options: [
+                  { value: 'low', name: 'Low' },
+                  { value: 'medium', name: 'Medium' },
+                  { value: 'high', name: 'High' },
+                  { value: 'xhigh', name: 'Extra' },
+                ],
+              },
+            ],
+          },
+        })
+      } else if (msg.method === 'session/set_config_option') {
+        const p = msg.params as { configId: string; value: string }
+        if (p.configId === 'model' && p.value === 'gemini-pro-orchestrator-neon') {
+          t.emit({
+            jsonrpc: '2.0',
+            id: msg.id,
+            result: {
+              configOptions: [
+                { id: 'model', category: 'model', type: 'select', currentValue: p.value, options: [] },
+              ],
+            },
+          })
+        } else {
+          t.emit({
+            jsonrpc: '2.0',
+            id: msg.id,
+            result: {
+              configOptions: [
+                { id: 'model', category: 'model', type: 'select', currentValue: 'gemini-4-carbon', options: [] },
+                {
+                  id: 'thought_level',
+                  category: 'thought_level',
+                  type: 'select',
+                  currentValue: p.configId === 'thought_level' ? p.value : 'medium',
+                  options: [
+                    { value: 'low', name: 'Low' },
+                    { value: 'medium', name: 'Medium' },
+                    { value: 'high', name: 'High' },
+                  ],
+                },
+              ],
+            },
+          })
+        }
+      }
+    })
+
+    const client = new AcpRuntimeClient({ cwd: '/repo', command: 'agy', args: ['acp', '--stdio'], transportFactory: () => transport })
+    // Legacy combined slug `gemini-4-carbon-high` auto-splits into base model + thought_level
+    await client.startOrResume({ modelId: 'gemini-4-carbon-high' })
+
+    expect(client.catalog?.models).toEqual([
+      {
+        id: 'gemini-4-neon',
+        name: 'Gemini 4 Neon',
+        thoughtLevels: [
+          { id: 'high', name: 'High' },
+          { id: 'xhigh', name: 'Extra' },
+        ],
+        defaultThoughtLevel: 'high',
+      },
+      {
+        id: 'gemini-4-carbon',
+        name: 'Gemini 4 Carbon',
+        thoughtLevels: [
+          { id: 'medium', name: 'Medium' },
+          { id: 'high', name: 'High' },
+        ],
+        defaultThoughtLevel: 'medium',
+      },
+      {
+        id: 'gemini-pro-orchestrator-neon',
+        name: 'Orchestrator (Neon)',
+        thoughtLevels: [],
+      },
+    ])
+
+    const setCalls = transport.sent
+      .filter((m) => m.method === 'session/set_config_option')
+      .map((m) => m.params)
+    expect(setCalls).toEqual([
+      { sessionId: 'acp_agy', configId: 'model', value: 'gemini-4-carbon' },
+      { sessionId: 'acp_agy', configId: 'thought_level', value: 'high' },
+    ])
+
+    // Switching to Orchestrator (no thought_level option) silently skips setThoughtLevel
+    await client.setModel('gemini-pro-orchestrator-neon')
+    await client.setThoughtLevel('high')
+    expect(
+      transport.sent.filter((m) => m.method === 'session/set_config_option').length,
+    ).toBe(3)
+    await client.close()
+  })
+
+  it('normalizes ClaudeCode and Antigravity ACP tool updates into native DSH tools and diffs', () => {
+    const activeTools = new Map<string, AcpActiveToolCall>()
+
+    // 1. ClaudeCode streaming Edit: initial empty tool_call defers tool-start until input/diff arrives
+    expect(
+      normalizeAcpSessionUpdate(
+        {
+          update: {
+            sessionUpdate: 'tool_call',
+            toolCallId: 'cc_edit_1',
+            name: 'Edit',
+            kind: 'edit',
+            rawInput: {},
+          },
+        },
+        activeTools,
+      ),
+    ).toEqual([])
+
+    const refinedEdit = normalizeAcpSessionUpdate(
+      {
+        update: {
+          sessionUpdate: 'tool_call_update',
+          toolCallId: 'cc_edit_1',
+          rawInput: { file_path: '/repo/src/app.ts' },
+          locations: [{ path: '/repo/src/app.ts' }],
+          content: [
+            {
+              type: 'diff',
+              path: '/repo/src/app.ts',
+              oldText: 'const oldVal = 1',
+              newText: 'const newVal = 2',
+            },
+          ],
+        },
+      },
+      activeTools,
+    )
+    expect(refinedEdit).toEqual([
+      {
+        type: 'tool-start',
+        callId: 'cc_edit_1',
+        name: 'edit',
+        arguments: JSON.stringify({
+          file_path: '/repo/src/app.ts',
+          old_string: 'const oldVal = 1',
+          new_string: 'const newVal = 2',
+        }),
+      },
+    ])
+
+    const completedEdit = normalizeAcpSessionUpdate(
+      {
+        update: {
+          sessionUpdate: 'tool_call_update',
+          toolCallId: 'cc_edit_1',
+          status: 'completed',
+          _meta: { claudeCode: { toolName: 'Edit' } },
+        },
+      },
+      activeTools,
+    )
+    expect(completedEdit).toEqual([
+      {
+        type: 'tool-complete',
+        callId: 'cc_edit_1',
+        name: 'edit',
+        output: '/repo/src/app.ts',
+        isError: false,
+        meta: {
+          path: '/repo/src/app.ts',
+          diffs: [
+            {
+              path: '/repo/src/app.ts',
+              oldText: 'const oldVal = 1',
+              newText: 'const newVal = 2',
+            },
+          ],
+        },
+      },
+    ])
+
+    // 2. ClaudeCode Bash with console fence and failing exit code -> native `bash` + `[exit code: N]`
+    const bashStart = normalizeAcpSessionUpdate(
+      {
+        update: {
+          sessionUpdate: 'tool_call',
+          toolCallId: 'cc_bash_1',
+          name: 'Bash',
+          kind: 'execute',
+          rawInput: { command: 'pnpm typecheck', description: 'Run typecheck' },
+        },
+      },
+      activeTools,
+    )
+    expect(bashStart).toEqual([
+      {
+        type: 'tool-start',
+        callId: 'cc_bash_1',
+        name: 'bash',
+        arguments: JSON.stringify({ command: 'pnpm typecheck', description: 'Run typecheck' }),
+      },
+    ])
+
+    const bashDone = normalizeAcpSessionUpdate(
+      {
+        update: {
+          sessionUpdate: 'tool_call_update',
+          toolCallId: 'cc_bash_1',
+          status: 'failed',
+          content: [{ type: 'content', content: { type: 'text', text: '```console\nExit code 2\nTS2322 error\n```' } }],
+        },
+      },
+      activeTools,
+    )
+    expect(bashDone).toEqual([
+      {
+        type: 'tool-complete',
+        callId: 'cc_bash_1',
+        name: 'bash',
+        output: 'TS2322 error\n[exit code: 2]',
+        isError: false,
+      },
+    ])
+
+    // 3. Antigravity tools: read_file (Path/StartLine/EndLine), grep_search, search_web, TodoWrite, MCP
+    const agyRead = normalizeAcpSessionUpdate(
+      {
+        update: {
+          sessionUpdate: 'tool_call',
+          toolCallId: 'agy_read_1',
+          name: 'read_file',
+          rawInput: { Path: '/repo/README.md', StartLine: 10, EndLine: 29 },
+        },
+      },
+      activeTools,
+    )
+    expect(agyRead).toEqual([
+      {
+        type: 'tool-start',
+        callId: 'agy_read_1',
+        name: 'read',
+        arguments: JSON.stringify({ file_path: '/repo/README.md', offset: 10, limit: 20 }),
+      },
+    ])
+
+    const agyGrep = normalizeAcpSessionUpdate(
+      {
+        update: {
+          sessionUpdate: 'tool_call',
+          toolCallId: 'agy_grep_1',
+          name: 'grep_search',
+          rawInput: { Query: 'RuntimeCatalog', SearchPath: '/repo/packages' },
+        },
+      },
+      activeTools,
+    )
+    expect(agyGrep).toEqual([
+      {
+        type: 'tool-start',
+        callId: 'agy_grep_1',
+        name: 'grep',
+        arguments: JSON.stringify({ pattern: 'RuntimeCatalog', path: '/repo/packages' }),
+      },
+    ])
+
+    const todoStart = normalizeAcpSessionUpdate(
+      {
+        update: {
+          sessionUpdate: 'tool_call',
+          toolCallId: 'cc_todo_1',
+          name: 'TodoWrite',
+          rawInput: { todos: [{ content: 'Ship native tools', status: 'in_progress' }] },
+        },
+      },
+      activeTools,
+    )
+    expect(todoStart).toEqual([
+      {
+        type: 'tool-start',
+        callId: 'cc_todo_1',
+        name: 'todo_write',
+        arguments: JSON.stringify({ todos: [{ content: 'Ship native tools', status: 'in_progress' }] }),
+      },
+    ])
+
+    const mcpStart = normalizeAcpSessionUpdate(
+      {
+        update: {
+          sessionUpdate: 'tool_call',
+          toolCallId: 'cc_mcp_1',
+          name: 'mcp__github__get_pull_request',
+          rawInput: { pullNumber: 12 },
+        },
+      },
+      activeTools,
+    )
+    expect(mcpStart).toEqual([
+      {
+        type: 'tool-start',
+        callId: 'cc_mcp_1',
+        name: 'github.get_pull_request',
+        arguments: JSON.stringify({ pullNumber: 12 }),
+      },
+    ])
+
+    expect(
+      normalizeAcpPermissionRequest({
+        sessionId: 'acp_s1',
+        toolCall: { toolCallId: 'p1', name: 'run_command', rawInput: { CommandLine: 'ls' }, title: 'List files' },
+        options: [{ optionId: 'allow_once', name: 'Allow', kind: 'allow_once' }],
+      }),
+    ).toMatchObject({
+      toolName: 'bash',
+      reason: 'List files',
+    })
+  })
+})
