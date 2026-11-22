@@ -43,8 +43,8 @@ flowchart LR
 
 1. 打开侧边栏 **插件 → 添加插件**。
 2. 填入任一安装源并点击 **安装**：
-   - **GitHub 仓库（推荐）**：`github:harryzhz/dsh-external-agents`（或 `https://github.com/harryzhz/dsh-external-agents`；pnpm ≥ 10 首次会拦截 `prepare` 脚本，按界面提示点击 **允许这些脚本并重试**）
-   - **GitHub Release `.tgz`**：Release 页面 `.tgz` 链接或本地绝对路径
+   - **GitHub Release `.tgz`（推荐，免构建脚本）**：`https://github.com/harryzhz/dsh-external-agents/releases/latest/download/dsh-external-agents.tgz`
+   - **GitHub 仓库**：`github:harryzhz/dsh-external-agents`（或 `https://github.com/harryzhz/dsh-external-agents`；pnpm ≥ 10 首次会拦截 `prepare` 脚本，按界面提示点击 **允许这些脚本并重试**）
    - **本地源码目录**：先在仓库运行 `pnpm install && pnpm build`，再填入绝对路径
 3. 点击 **立即启用**，并 **重启一次 DSH** 让外部运行时生效。
 
@@ -53,11 +53,11 @@ flowchart LR
 > `--profile <name>` 须写在 `add` / `remove` 之前。`desktop` profile 由桌面端托管，请使用上方界面安装。
 
 ```bash
-# 从 GitHub 仓库安装（推荐，也可使用 https://github.com/harryzhz/dsh-external-agents）
-dsh plugin --profile web add github:harryzhz/dsh-external-agents
+# 从 GitHub Release latest .tgz 安装（推荐，免构建脚本）
+dsh plugin --profile web add https://github.com/harryzhz/dsh-external-agents/releases/latest/download/dsh-external-agents.tgz
 
-# 从 Release .tgz 安装（支持 URL 或本地路径）
-dsh plugin --profile web add ./harryzhz-dsh-external-agents-0.3.0.tgz
+# 从 GitHub 仓库安装（也可使用 https://github.com/harryzhz/dsh-external-agents）
+dsh plugin --profile web add github:harryzhz/dsh-external-agents
 
 # 从本地已构建仓库安装
 dsh plugin --profile web add file:/absolute/path/to/dsh-external-agents
@@ -114,7 +114,7 @@ dsh plugin --profile web remove @harryzhz/dsh-external-agents # 卸载
 
 ## 搭配 `dsh-lark-bridge` 使用
 
-与 [dsh-lark-bridge](https://github.com/harryzhz/dsh-lark-bridge) 一起安装后（例如 `dsh plugin --profile web add github:harryzhz/dsh-external-agents github:harryzhz/dsh-lark-bridge`），重启 DSH 即可在飞书智能体和群聊配置中直接选择外部运行时与模型，实景效果可参考 `dsh-lark-bridge` 仓库中的产品演示视频。
+与 [dsh-lark-bridge](https://github.com/harryzhz/dsh-lark-bridge) 一起安装后（例如 `dsh plugin --profile web add https://github.com/harryzhz/dsh-external-agents/releases/latest/download/dsh-external-agents.tgz https://github.com/harryzhz/dsh-lark-bridge/releases/latest/download/dsh-lark-bridge.tgz`），重启 DSH 即可在飞书智能体和群聊配置中直接选择外部运行时与模型，实景效果可参考 `dsh-lark-bridge` 仓库中的产品演示视频。
 
 ## 开发与打包
 
