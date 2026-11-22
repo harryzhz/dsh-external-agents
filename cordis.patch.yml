@@ -40,7 +40,7 @@
         order: 13
         plugins: []
     - id: dsh-external-agents
-      name: 'dsh-external-agents'
+      name: '@harryzhz/dsh-external-agents'
       config:
         idleEvictMs: 900000
         runtimes:

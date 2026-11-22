@@ -1,15 +1,16 @@
 #!/usr/bin/env node
 /**
- * Self-contained bundle builder for root `dsh-external-agents`.
+ * Self-contained bundle builder for root `@harryzhz/dsh-external-agents`.
  * Can run with ONLY root `devDependencies` (`esbuild`) during Git installs (`prepare`)
  * or full workspace builds (`pnpm build`).
  */
-import { existsSync, mkdirSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { build } from 'esbuild'
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
+const rootPackageName = JSON.parse(readFileSync(resolve(repoRoot, 'package.json'), 'utf8')).name
 const entryFile = resolve(repoRoot, 'packages/plugin/src/index.ts')
 const outFile = resolve(repoRoot, 'dist/index.js')
 
@@ -51,7 +52,7 @@ export async function buildExternalAgentsBundle() {
     ],
   })
 
-  console.log('Built standalone bundle dsh-external-agents:', outFile)
+  console.log(`Built standalone bundle ${rootPackageName}:`, outFile)
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

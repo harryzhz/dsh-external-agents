@@ -7,7 +7,7 @@
 - `packages/runtime/codex`（`@dsh-external-agents/runtime-codex`）— 纯 TS `codex app-server` JSON-RPC 客户端（零 DSH 依赖）
 - `packages/runtime/acp`（`@dsh-external-agents/runtime-acp`）— 纯 TS 通用 ACP（Agent Client Protocol）stdio JSON-RPC 客户端，支持能力协商与 `session/resume` → `session/load` → `session/new` 自动回退（零 DSH 依赖）
 - `packages/plugin`（`@dsh-external-agents/plugin`）— 薄 DSH Host 插件：包装 `AgentLoop`、通过 `ExternalRuntimeRegistry` 统一管理可插拔外部运行时、映射流式事件/工具调用/审批/提问并发布 `ctx.externalRuntimes`
-- 根包 `dsh-external-agents`（`package.json` + `cordis.patch.yml` + `scripts/prepare.mjs`）— 面向 DSH Desktop / Web「添加插件」发布的零运行期依赖独立 Bundle（支持 npm / Release `.tgz` / Git 仓库直装）
+- 根包 `@harryzhz/dsh-external-agents`（`package.json` + `cordis.patch.yml` + `scripts/prepare.mjs`）— 面向 DSH Desktop / Web「添加插件」发布的零运行期依赖独立 Bundle（支持 GitHub 仓库直装 / Release `.tgz` / 本地目录安装）
 
 ## 目录组织规范
 
