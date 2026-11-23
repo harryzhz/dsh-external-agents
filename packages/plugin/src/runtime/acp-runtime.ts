@@ -13,20 +13,21 @@ import {
 import type { CatalogModelEntry } from '../catalog-adapter.js'
 import type { ExternalAgent } from '../external-agent.js'
 import type {
+  ExternalRuntimeAuthMethod,
   ExternalRuntimeDriver,
+  ExternalRuntimeProfile,
   ExternalTurnEvent,
   ExternalTurnRequest,
   ExternalTurnRunResult,
 } from '../types.js'
 import {
-  buildRuntimeEnv,
   contextWindowFor,
   expandRuntimeCwd,
-  resolveRuntimeCommand,
   type ExternalRuntimeSpec,
 } from './config.js'
 import { toRuntimeSummary, type ExternalRuntimeDefinition } from './definition.js'
 import { readImageSource } from './message-content.js'
+import { resolveProfileCapabilities, resolveRuntimeLaunchPlan } from './profile-resolver.js'
 
 function extractAcpPromptBlocks(messages: readonly UserMessage[]): AcpPromptBlock[] {
   const blocks: AcpPromptBlock[] = []
@@ -74,10 +75,16 @@ async function bridgeAcpPermission(
 
 function launchOptions(
   spec: ExternalRuntimeSpec,
+  profile?: ExternalRuntimeProfile,
   extraEnv?: Readonly<Record<string, string>>,
-): Pick<AcpRuntimeOptions, 'command' | 'args' | 'env'> {
-  const env = buildRuntimeEnv(spec, extraEnv)
-  return { command: resolveRuntimeCommand(spec, env), args: spec.args, env }
+): Pick<AcpRuntimeOptions, 'command' | 'args' | 'env' | 'authMethodId'> {
+  const plan = resolveRuntimeLaunchPlan(spec, profile, extraEnv)
+  return {
+    command: plan.command,
+    args: plan.args,
+    env: plan.env,
+    ...(plan.authMethodId ? { authMethodId: plan.authMethodId } : {}),
+  }
 }
 
 class AcpDriverAdapter implements ExternalRuntimeDriver {
@@ -88,11 +95,12 @@ class AcpDriverAdapter implements ExternalRuntimeDriver {
     private readonly ctx: Context,
     private readonly agent: ExternalAgent,
     spec: ExternalRuntimeSpec,
+    profile?: ExternalRuntimeProfile,
   ) {
     this.kind = spec.id
     this.client = new AcpRuntimeClient({
       cwd: expandRuntimeCwd(agent.session.header.cwd),
-      ...launchOptions(spec, { DSH_SESSION_ID: agent.id }),
+      ...launchOptions(spec, profile, { DSH_SESSION_ID: agent.id }),
       logger: (msg) => ctx.logger.warn(msg),
     })
   }
@@ -149,24 +157,46 @@ class AcpDriverAdapter implements ExternalRuntimeDriver {
 
 /** Any agent speaking the Agent Client Protocol over stdio. */
 export function createAcpRuntime(spec: ExternalRuntimeSpec): ExternalRuntimeDefinition {
+  let cachedAuthMethods: readonly ExternalRuntimeAuthMethod[] | undefined
+
   return {
     ...toRuntimeSummary(spec),
     fallbackModels: spec.fallbackModels,
-    async probeModels(): Promise<readonly CatalogModelEntry[]> {
-      const snapshot = await AcpRuntimeClient.probeCatalog({ cwd: process.cwd(), ...launchOptions(spec) })
+    getLiveAuthMethods: () => cachedAuthMethods,
+    getProfileCapabilities: () => resolveProfileCapabilities(spec, cachedAuthMethods),
+    async probeModels(profile?: ExternalRuntimeProfile): Promise<readonly CatalogModelEntry[]> {
+      const plan = resolveRuntimeLaunchPlan(spec, profile)
+      const snapshot = await AcpRuntimeClient.probeCatalog({
+        cwd: process.cwd(),
+        command: plan.command,
+        args: plan.args,
+        env: plan.env,
+        ...(plan.authMethodId ? { authMethodId: plan.authMethodId } : {}),
+      })
+      if (snapshot.authMethods && snapshot.authMethods.length > 0) {
+        cachedAuthMethods = snapshot.authMethods
+      }
+      const preferredDefault = plan.defaultModel || snapshot.currentModelId
       return snapshot.models.map((m) => {
         const contextWindow = contextWindowFor(spec, m.id)
+        const isDefault = Boolean(preferredDefault && m.id === preferredDefault)
+        const efforts = m.thoughtLevels?.map((t) => t.id)
+        const defaultEffort =
+          isDefault &&
+          plan.defaultReasoningEffort &&
+          (!efforts || efforts.includes(plan.defaultReasoningEffort))
+            ? plan.defaultReasoningEffort
+            : m.defaultThoughtLevel
         return {
           id: m.id,
           name: m.name,
           ...(contextWindow ? { contextWindow } : {}),
-          ...(m.thoughtLevels !== undefined
-            ? { reasoningEfforts: m.thoughtLevels.map((t) => t.id) }
-            : {}),
-          ...(m.defaultThoughtLevel ? { defaultEffort: m.defaultThoughtLevel } : {}),
+          ...(isDefault ? { isDefault: true } : {}),
+          ...(efforts !== undefined ? { reasoningEfforts: efforts } : {}),
+          ...(defaultEffort ? { defaultEffort } : {}),
         }
       })
     },
-    createDriver: ({ ctx, agent }) => new AcpDriverAdapter(ctx, agent, spec),
+    createDriver: ({ ctx, agent, profile }) => new AcpDriverAdapter(ctx, agent, spec, profile),
   }
 }

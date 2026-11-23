@@ -55,6 +55,7 @@ export class AcpRuntimeClient {
   private readonly command: string
   private readonly args: readonly string[]
   private readonly env: NodeJS.ProcessEnv
+  private readonly defaultAuthMethodId?: string
   private readonly label: string
   private readonly requestTimeoutMs: number
   private readonly clientName: string
@@ -65,6 +66,7 @@ export class AcpRuntimeClient {
   private transport?: AcpJsonRpcTransport
   private nextId = 1
   private initResult?: AcpInitializeResult
+  private authenticatedMethodId?: string
   private closed = false
   private currentSessionId?: string
   private catalogSnapshot?: AcpCatalogSnapshot
@@ -76,6 +78,7 @@ export class AcpRuntimeClient {
     this.command = options.command
     this.args = options.args
     this.env = options.env ?? process.env
+    this.defaultAuthMethodId = options.authMethodId?.trim() || undefined
     this.label = `acp(${options.command})`
     this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS
     this.clientName = options.clientName ?? 'dsh-external-agents'
@@ -130,6 +133,18 @@ export class AcpRuntimeClient {
     return this.initResult
   }
 
+  async authenticate(methodId: string): Promise<void> {
+    const clean = methodId.trim()
+    if (!clean) return
+    const init = await this.initialize()
+    if (init.authMethods.length > 0 && !init.authMethods.some((m) => m.id === clean)) {
+      const supported = init.authMethods.map((m) => m.id).join(', ')
+      throw new Error(`${this.label} unsupported authMethod "${clean}" (available: ${supported})`)
+    }
+    await this.request('authenticate', { methodId: clean })
+    this.authenticatedMethodId = clean
+  }
+
   /**
    * Open a session. With `sessionId`, recovery follows negotiated capabilities:
    * `session/resume` first (unless declared unsupported), then `session/load`
@@ -138,11 +153,19 @@ export class AcpRuntimeClient {
    */
   async startOrResume(options: AcpStartOptions = {}): Promise<string> {
     const init = await this.initialize()
+    const targetAuthMethod = options.authMethodId?.trim() || this.defaultAuthMethodId
+    if (targetAuthMethod && this.authenticatedMethodId !== targetAuthMethod) {
+      await this.authenticate(targetAuthMethod)
+    }
     const opened = options.sessionId
       ? await this.restoreSession(options.sessionId, init.agentCapabilities)
       : await this.newSession()
     this.currentSessionId = opened.sessionId
-    this.catalogSnapshot = parseAcpCatalog(opened.result)
+    const parsedCatalog = parseAcpCatalog(opened.result)
+    this.catalogSnapshot =
+      init.authMethods.length > 0
+        ? { ...parsedCatalog, authMethods: init.authMethods }
+        : parsedCatalog
 
     const normalized = this.normalizeModelAndThought(options.modelId, options.thoughtLevel)
     if (normalized.modelId && normalized.modelId !== this.catalogSnapshot.currentModelId) {
@@ -287,6 +310,7 @@ export class AcpRuntimeClient {
     const transport = this.transport
     this.transport = undefined
     this.initResult = undefined
+    this.authenticatedMethodId = undefined
     this.failPending(new Error(`${this.label} runtime closed`))
     if (transport) {
       await transport.close()
@@ -555,6 +579,7 @@ export class AcpRuntimeClient {
 
   private handleTransportClosed(error?: Error): void {
     this.initResult = undefined
+    this.authenticatedMethodId = undefined
     this.transport = undefined
     this.failPending(error ?? new Error(`${this.label} transport closed`))
   }

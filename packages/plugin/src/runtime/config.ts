@@ -218,6 +218,11 @@ function mergeRuntime(base: ExternalRuntimeSpec, override: ExternalRuntimeOverri
     ...(keepCandidates ? { commandCandidates: keepCandidates } : {}),
     args: override.args && override.args.length > 0 ? [...override.args] : base.args,
     env: { ...base.env, ...override.env },
+    ...(override.profiles && override.profiles.length > 0
+      ? { profiles: [...override.profiles] }
+      : base.profiles
+        ? { profiles: base.profiles }
+        : {}),
     fallbackModels: base.fallbackModels,
   }
 }

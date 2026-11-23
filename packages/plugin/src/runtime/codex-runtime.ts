@@ -14,19 +14,19 @@ import type { CatalogModelEntry } from '../catalog-adapter.js'
 import type { ExternalAgent } from '../external-agent.js'
 import type {
   ExternalRuntimeDriver,
+  ExternalRuntimeProfile,
   ExternalTurnEvent,
   ExternalTurnRequest,
   ExternalTurnRunResult,
 } from '../types.js'
 import {
-  buildRuntimeEnv,
   contextWindowFor,
   expandRuntimeCwd,
-  resolveRuntimeCommand,
   type ExternalRuntimeSpec,
 } from './config.js'
 import { toRuntimeSummary, type ExternalRuntimeDefinition } from './definition.js'
 import { extractTextFromMessages, readImageSource } from './message-content.js'
+import { resolveProfileCapabilities, resolveRuntimeLaunchPlan } from './profile-resolver.js'
 
 function extractCodexImages(messages: readonly UserMessage[]): Array<{ url: string }> {
   const images: Array<{ url: string }> = []
@@ -108,14 +108,15 @@ class CodexDriverAdapter implements ExternalRuntimeDriver {
     private readonly ctx: Context,
     private readonly agent: ExternalAgent,
     private readonly spec: ExternalRuntimeSpec,
+    profile?: ExternalRuntimeProfile,
   ) {
     this.kind = spec.id
-    const env = buildRuntimeEnv(spec, { DSH_SESSION_ID: agent.id })
+    const plan = resolveRuntimeLaunchPlan(spec, profile, { DSH_SESSION_ID: agent.id })
     this.client = new CodexRuntimeClient({
       cwd: expandRuntimeCwd(agent.session.header.cwd),
-      cliBin: resolveRuntimeCommand(spec, env),
-      args: spec.args,
-      env,
+      cliBin: plan.command,
+      args: plan.args,
+      env: plan.env,
       logger: (msg) => ctx.logger.warn(msg),
     })
   }
@@ -183,25 +184,36 @@ export function createCodexRuntime(spec: ExternalRuntimeSpec): ExternalRuntimeDe
   return {
     ...toRuntimeSummary(spec),
     fallbackModels: spec.fallbackModels,
-    async probeModels(): Promise<readonly CatalogModelEntry[]> {
-      const env = buildRuntimeEnv(spec)
+    getProfileCapabilities: () => resolveProfileCapabilities(spec),
+    async probeModels(profile?: ExternalRuntimeProfile): Promise<readonly CatalogModelEntry[]> {
+      const plan = resolveRuntimeLaunchPlan(spec, profile)
       const models = await CodexRuntimeClient.probeModels({
         cwd: process.cwd(),
-        cliBin: resolveRuntimeCommand(spec, env),
-        args: spec.args,
-        env,
+        cliBin: plan.command,
+        args: plan.args,
+        env: plan.env,
       })
+      const hasPlanDefault = Boolean(
+        plan.defaultModel && models.some((m) => m.id === plan.defaultModel),
+      )
       return models.map((m) => {
         const contextWindow = m.contextWindow ?? contextWindowFor(spec, m.id)
+        const isDefault = hasPlanDefault ? m.id === plan.defaultModel : Boolean(m.isDefault)
+        const defaultEffort =
+          isDefault &&
+          plan.defaultReasoningEffort &&
+          m.supportedReasoningEfforts.includes(plan.defaultReasoningEffort)
+            ? plan.defaultReasoningEffort
+            : m.defaultReasoningEffort ?? m.supportedReasoningEfforts[0]
         return {
           id: m.id,
           name: m.name,
           ...(contextWindow ? { contextWindow } : {}),
-          ...(m.isDefault ? { isDefault: true } : {}),
+          ...(isDefault ? { isDefault: true } : {}),
           ...(m.supportedReasoningEfforts.length > 0
             ? {
                 reasoningEfforts: m.supportedReasoningEfforts,
-                defaultEffort: m.defaultReasoningEffort ?? m.supportedReasoningEfforts[0],
+                defaultEffort,
               }
             : m.reasoningEffortsDeclared
               ? { reasoningEfforts: [] }
@@ -209,6 +221,6 @@ export function createCodexRuntime(spec: ExternalRuntimeSpec): ExternalRuntimeDe
         }
       })
     },
-    createDriver: ({ ctx, agent }) => new CodexDriverAdapter(ctx, agent, spec),
+    createDriver: ({ ctx, agent, profile }) => new CodexDriverAdapter(ctx, agent, spec, profile),
   }
 }

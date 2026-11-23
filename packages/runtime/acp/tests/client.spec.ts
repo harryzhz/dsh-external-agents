@@ -545,6 +545,86 @@ describe('AcpRuntimeClient model config options', () => {
     await client.close()
   })
 
+  it('preserves full per-model thoughtLevels even when session/new starts on a model with fewer levels', async () => {
+    const transport = new MockAcpTransport((msg, t) => {
+      if (msg.method === 'initialize') {
+        t.emit({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1, agentCapabilities: {} } })
+      } else if (msg.method === 'session/new') {
+        t.emit({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            sessionId: 'acp_narrow_default',
+            models: {
+              currentModelId: 'gemini-3.1-pro-low',
+              availableModels: [
+                { modelId: 'gemini-4-neon-high', name: 'Gemini 4 Neon (High)' },
+                { modelId: 'gemini-4-neon-xhigh', name: 'Gemini 4 Neon (XHigh)' },
+                { modelId: 'gemini-4-neon-medium', name: 'Gemini 4 Neon (Medium)' },
+                { modelId: 'gemini-4-neon-low', name: 'Gemini 4 Neon (Low)' },
+                { modelId: 'gemini-4-carbon-high', name: 'Gemini 4 Carbon (High)' },
+                { modelId: 'gemini-4-carbon-medium', name: 'Gemini 4 Carbon (Medium)' },
+                { modelId: 'gemini-4-carbon-low', name: 'Gemini 4 Carbon (Low)' },
+                { modelId: 'gemini-3.1-pro-high', name: 'Gemini 3.1 Pro (High)' },
+                { modelId: 'gemini-3.1-pro-low', name: 'Gemini 3.1 Pro (Low)' },
+                { modelId: 'gemini-pro-orchestrator', name: 'Orchestrator' },
+                { modelId: 'gemini-pro-orchestrator-neon', name: 'Orchestrator (Neon)' },
+              ],
+            },
+            configOptions: [
+              {
+                id: 'model',
+                category: 'model',
+                type: 'select',
+                currentValue: 'gemini-3.1-pro',
+                options: [
+                  { value: 'gemini-4-neon', name: 'Gemini 4 Neon' },
+                  { value: 'gemini-4-carbon', name: 'Gemini 4 Carbon' },
+                  { value: 'gemini-3.1-pro', name: 'Gemini 3.1 Pro' },
+                  { value: 'gemini-pro-orchestrator', name: 'Orchestrator' },
+                  { value: 'gemini-pro-orchestrator-neon', name: 'Orchestrator (Neon)' },
+                ],
+              },
+              {
+                id: 'thought_level',
+                category: 'thought_level',
+                type: 'select',
+                currentValue: 'low',
+                options: [
+                  { value: 'low', name: 'Low' },
+                  { value: 'high', name: 'High' },
+                ],
+              },
+            ],
+          },
+        })
+      }
+    })
+
+    const snap = await AcpRuntimeClient.probeCatalog({
+      cwd: '/repo',
+      command: 'agy',
+      args: ['acp', '--stdio'],
+      transportFactory: () => transport,
+    })
+
+    const byId = new Map(snap.models.map((m) => [m.id, m]))
+    expect(byId.get('gemini-4-neon')?.thoughtLevels?.map((t) => t.id)).toEqual([
+      'low',
+      'medium',
+      'high',
+      'xhigh',
+    ])
+    expect(byId.get('gemini-4-carbon')?.thoughtLevels?.map((t) => t.id)).toEqual([
+      'low',
+      'medium',
+      'high',
+    ])
+    expect(byId.get('gemini-3.1-pro')?.thoughtLevels?.map((t) => t.id)).toEqual(['low', 'high'])
+    expect(byId.get('gemini-pro-orchestrator')?.thoughtLevels).toEqual([])
+    expect(byId.get('gemini-pro-orchestrator-neon')?.thoughtLevels).toEqual([])
+  })
+
   it('normalizes ClaudeCode and Antigravity ACP tool updates into native DSH tools and diffs', () => {
     const activeTools = new Map<string, AcpActiveToolCall>()
 
@@ -761,5 +841,77 @@ describe('AcpRuntimeClient model config options', () => {
       toolName: 'bash',
       reason: 'List files',
     })
+  })
+
+  it('invokes ACP authenticate before session/new when authMethodId is configured and rejects unsupported methods', async () => {
+    const transport = new MockAcpTransport((msg, t) => {
+      if (msg.method === 'initialize') {
+        t.emit({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            protocolVersion: 1,
+            agentCapabilities: {},
+            authMethods: [
+              { id: 'oauth-personal', name: 'Google Account' },
+              { id: 'gemini-api-key', name: 'Gemini API Key' },
+            ],
+          },
+        })
+      } else if (msg.method === 'authenticate') {
+        t.emit({ jsonrpc: '2.0', id: msg.id, result: {} })
+      } else if (msg.method === 'session/new') {
+        t.emit({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            sessionId: 'acp_auth_1',
+            models: {
+              currentModelId: 'gemini-4-carbon-medium',
+              availableModels: [{ modelId: 'gemini-4-carbon-medium', name: 'Gemini 4 Carbon (Medium)' }],
+            },
+          },
+        })
+      }
+    })
+
+    const client = new AcpRuntimeClient({
+      cwd: '/repo',
+      command: 'agy',
+      args: ['--settings', '/Users/demo/.config/proxy/settings.json', 'acp', '--stdio'],
+      authMethodId: 'gemini-api-key',
+      transportFactory: () => transport,
+    })
+
+    const sid = await client.startOrResume()
+    expect(sid).toBe('acp_auth_1')
+    expect(transport.sent.map((m) => m.method)).toEqual(['initialize', 'authenticate', 'session/new'])
+    expect(transport.sent.find((m) => m.method === 'authenticate')?.params).toEqual({
+      methodId: 'gemini-api-key',
+    })
+    expect(client.catalog?.authMethods).toEqual([
+      { id: 'oauth-personal', name: 'Google Account' },
+      { id: 'gemini-api-key', name: 'Gemini API Key' },
+    ])
+    await client.close()
+
+    const badClient = new AcpRuntimeClient({
+      cwd: '/repo',
+      command: 'agy',
+      args: ['acp', '--stdio'],
+      authMethodId: 'nonexistent-method',
+      transportFactory: () =>
+        new MockAcpTransport((msg, t) => {
+          if (msg.method === 'initialize') {
+            t.emit({
+              jsonrpc: '2.0',
+              id: msg.id,
+              result: { protocolVersion: 1, authMethods: [{ id: 'oauth-personal', name: 'Google' }] },
+            })
+          }
+        }),
+    })
+    await expect(badClient.startOrResume()).rejects.toThrow(/unsupported authMethod "nonexistent-method"/)
+    await badClient.close()
   })
 })

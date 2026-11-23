@@ -143,6 +143,46 @@ function findSelectConfigOption(root: JsonRecord, category: string): SelectConfi
   return undefined
 }
 
+const CANONICAL_THOUGHT_LEVELS: readonly AcpThoughtLevelInfo[] = [
+  { id: 'none', name: 'None' },
+  { id: 'minimal', name: 'Minimal' },
+  { id: 'low', name: 'Low' },
+  { id: 'medium', name: 'Medium' },
+  { id: 'high', name: 'High' },
+  { id: 'xhigh', name: 'XHigh' },
+  { id: 'max', name: 'Max' },
+  { id: 'ultra', name: 'Ultra' },
+]
+
+/**
+ * Merge canonical thought levels with any extra levels advertised by the agent's
+ * active model. `configOptions[category="thought_level"]` only reflects the
+ * currently selected model (e.g. a model supporting only `low`/`high`), so it
+ * must never restrict the candidate set used to probe per-model legacy slugs.
+ */
+function buildCandidateThoughtLevels(
+  selectableThoughtLevels: readonly AcpThoughtLevelInfo[],
+): readonly AcpThoughtLevelInfo[] {
+  const liveById = new Map<string, AcpThoughtLevelInfo>()
+  for (const lvl of selectableThoughtLevels) {
+    liveById.set(lvl.id.toLowerCase(), lvl)
+  }
+  const merged: AcpThoughtLevelInfo[] = []
+  const seen = new Set<string>()
+  for (const canonical of CANONICAL_THOUGHT_LEVELS) {
+    const live = liveById.get(canonical.id)
+    merged.push(live ? { id: canonical.id, name: live.name } : canonical)
+    seen.add(canonical.id)
+  }
+  for (const lvl of selectableThoughtLevels) {
+    const key = lvl.id.toLowerCase()
+    if (seen.has(key)) continue
+    seen.add(key)
+    merged.push(lvl)
+  }
+  return merged
+}
+
 /**
  * Read models/modes/thoughtLevels from a session/new|load|resume|set_config_option result.
  * Prefers structured `configOptions` (`category: "model"` + `category: "thought_level"`) when
@@ -171,21 +211,15 @@ export function parseAcpCatalog(sessionResult: unknown): AcpCatalogSnapshot {
   let models: readonly AcpModelInfo[]
   if (modelOption && modelOption.values.length > 0) {
     const legacyIds = new Set(legacyFlatModels.map((m) => m.id))
-    const candidateLevels: readonly AcpThoughtLevelInfo[] =
-      selectableThoughtLevels.length > 0
-        ? selectableThoughtLevels
-        : [
-            { id: 'low', name: 'Low' },
-            { id: 'medium', name: 'Medium' },
-            { id: 'high', name: 'High' },
-            { id: 'xhigh', name: 'XHigh' },
-            { id: 'max', name: 'Max' },
-            { id: 'ultra', name: 'Ultra' },
-          ]
+    const baseModelIds = new Set(modelOption.values.map((m) => m.id))
+    const candidateLevels = buildCandidateThoughtLevels(selectableThoughtLevels)
 
     models = modelOption.values.map((base) => {
       if (legacyIds.size > 0) {
-        const supported = candidateLevels.filter((lvl) => legacyIds.has(`${base.id}-${lvl.id}`))
+        const supported = candidateLevels.filter((lvl) => {
+          const combinedId = `${base.id}-${lvl.id}`
+          return legacyIds.has(combinedId) && !baseModelIds.has(combinedId)
+        })
         let defaultThoughtLevel: string | undefined
         if (supported.length > 0) {
           if (legacyCurrentModelId?.startsWith(`${base.id}-`)) {

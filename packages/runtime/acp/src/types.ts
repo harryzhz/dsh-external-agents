@@ -31,6 +31,7 @@ export interface AcpModeInfo {
 export interface AcpCatalogSnapshot {
   readonly models: readonly AcpModelInfo[]
   readonly modes: readonly AcpModeInfo[]
+  readonly authMethods?: readonly AcpAuthMethod[]
   readonly thoughtLevels?: readonly AcpThoughtLevelInfo[]
   readonly currentModelId?: string
   readonly currentModeId?: string
@@ -155,6 +156,7 @@ export interface AcpStartOptions {
   readonly modelId?: string
   readonly thoughtLevel?: string
   readonly modeId?: string
+  readonly authMethodId?: string
 }
 
 export interface AcpTransportFactoryOptions {
@@ -172,6 +174,8 @@ export interface AcpRuntimeOptions {
   readonly args: readonly string[]
   /** Child environment; defaults to `process.env`. Passed through unchanged. */
   readonly env?: NodeJS.ProcessEnv
+  /** Optional ACP authentication method id to invoke right after `initialize` (e.g. `gemini-api-key`). */
+  readonly authMethodId?: string
   readonly requestTimeoutMs?: number
   readonly clientName?: string
   readonly clientVersion?: string

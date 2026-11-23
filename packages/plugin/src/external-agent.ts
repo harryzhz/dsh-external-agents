@@ -26,9 +26,12 @@ import type { ExternalRuntimeDefinition } from './runtime/definition.js'
 import { ExternalStepRecorder } from './step-recorder.js'
 import {
   EXTERNAL_BINDING_RECORD_TYPE,
+  EXTERNAL_LAUNCH_RECORD_TYPE,
   type ExternalBindingRecord,
   type ExternalDriverKind,
+  type ExternalLaunchRecord,
   type ExternalRuntimeDriver,
+  type ExternalRuntimeProfile,
 } from './types.js'
 
 export interface ExternalAgentProjections {
@@ -41,12 +44,17 @@ export interface ExternalAgentDeps {
   readonly id: SessionId
   readonly runtime: ExternalRuntimeDefinition
   readonly resolveRuntime?: (session: Session) => ExternalRuntimeDefinition | undefined
+  readonly resolveProfile?: (runtimeId: string, profileId: string) => ExternalRuntimeProfile | undefined
   readonly idleEvictMs: number
   readonly options: AgentOptions
   readonly session: Session
   readonly projections: ExternalAgentProjections
   readonly lastTurn: number
-  readonly resolveCatalogModels?: (providerId: string) => Promise<readonly CatalogModelEntry[] | undefined>
+  readonly resolveCatalogModels?: (
+    providerId: string,
+    runtimeId?: string,
+    profileId?: string,
+  ) => Promise<readonly CatalogModelEntry[] | undefined>
 }
 
 function readPersistedExternalId(session: Session, driver: ExternalDriverKind): string | undefined {
@@ -57,6 +65,23 @@ function readPersistedExternalId(session: Session, driver: ExternalDriverKind): 
     const data = rec.data as Partial<ExternalBindingRecord> | undefined
     if (data?.driver === driver && typeof data.externalId === 'string' && data.externalId.length > 0) {
       return data.externalId
+    }
+  }
+  return undefined
+}
+
+function readPersistedLaunchProfileId(session: Session, runtimeId: string): string | undefined {
+  const events = session.snapshotEvents()
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    const rec = pluginRecordOf(events[i]!)
+    if (rec?.type !== EXTERNAL_LAUNCH_RECORD_TYPE) continue
+    const data = rec.data as Partial<ExternalLaunchRecord> | undefined
+    if (
+      data?.runtimeId === runtimeId &&
+      typeof data.profileId === 'string' &&
+      data.profileId.trim().length > 0
+    ) {
+      return data.profileId.trim()
     }
   }
   return undefined
@@ -76,9 +101,17 @@ export class ExternalAgent implements Agent {
   private readonly rootCtx: Context
   private readonly initialRuntime: ExternalRuntimeDefinition
   private readonly resolveRuntimeFn?: (session: Session) => ExternalRuntimeDefinition | undefined
+  private readonly resolveProfileFn?: (
+    runtimeId: string,
+    profileId: string,
+  ) => ExternalRuntimeProfile | undefined
   private readonly idleEvictMs: number
   private readonly dispatch: ReturnType<typeof agentEvents>
-  private readonly resolveCatalogModels?: (providerId: string) => Promise<readonly CatalogModelEntry[] | undefined>
+  private readonly resolveCatalogModels?: (
+    providerId: string,
+    runtimeId?: string,
+    profileId?: string,
+  ) => Promise<readonly CatalogModelEntry[] | undefined>
 
   private lastTurn: number
   private attemptSeq = 0
@@ -87,7 +120,7 @@ export class ExternalAgent implements Agent {
   private activeAbort: AbortController | null = null
   private activeCancelCause: AgentCancelCause = { kind: 'user' }
   private driver: ExternalRuntimeDriver | null = null
-  private driverRuntimeId?: string
+  private driverRuntimeKey?: string
   private initialSelectionKey?: string
   private idleTimer: ReturnType<typeof setTimeout> | null = null
   private disposed = false
@@ -97,6 +130,7 @@ export class ExternalAgent implements Agent {
     this.id = deps.id
     this.initialRuntime = deps.runtime
     this.resolveRuntimeFn = deps.resolveRuntime
+    this.resolveProfileFn = deps.resolveProfile
     this.idleEvictMs = deps.idleEvictMs
     this.options = deps.options
     this.session = deps.session
@@ -174,20 +208,34 @@ export class ExternalAgent implements Agent {
     })
   }
 
+  private resolveActiveProfile(activeRuntime: ExternalRuntimeDefinition): ExternalRuntimeProfile | undefined {
+    const baseRuntimeId = activeRuntime.parentRuntimeId ?? activeRuntime.id
+    if (activeRuntime.profileId) {
+      return this.resolveProfileFn?.(baseRuntimeId, activeRuntime.profileId) ?? activeRuntime.boundProfile
+    }
+    const persistedProfileId = readPersistedLaunchProfileId(this.session, baseRuntimeId)
+    if (!persistedProfileId) return undefined
+    return this.resolveProfileFn?.(baseRuntimeId, persistedProfileId)
+  }
+
   /**
    * The session's current selection applies only when it targets this runtime's
    * provider; when unset, resolves the live catalog's default model so multi-region
    * CLIs (e.g. TRAE CN vs TRAE International) never pass a non-existent static default id.
    */
   private async resolveSelection(): Promise<{ provider: string; model: string; reasoningEffort?: string }> {
+    const activeRuntime = this.runtime
+    const activeProfile = this.resolveActiveProfile(activeRuntime)
     const current = this.model.current()
-    const provider = this.runtime.providerId
+    const provider = activeRuntime.providerId
     const matched = current?.provider === provider ? current : undefined
     let model = matched?.model
     let catalog: readonly CatalogModelEntry[] | undefined
     if (!model) {
-      catalog = await this.resolveCatalogModels?.(provider).catch(() => undefined)
-      const configured = this.runtime.defaultModel
+      catalog = await this.resolveCatalogModels
+        ?.(provider, activeRuntime.parentRuntimeId ?? activeRuntime.id, activeProfile?.id)
+        .catch(() => undefined)
+      const configured = activeProfile?.defaultModel ?? activeRuntime.defaultModel
       if (configured && (!catalog || catalog.length === 0 || catalog.some((m) => m.id === configured))) {
         model = configured
       } else {
@@ -195,9 +243,19 @@ export class ExternalAgent implements Agent {
       }
     }
     const entry = catalog?.find((m) => m.id === model)
-    let reasoningEffort = matched?.reasoningEffort ?? this.runtime.defaultReasoningEffort
-    if (entry?.reasoningEfforts !== undefined && entry.reasoningEfforts.length === 0) {
-      reasoningEffort = undefined
+    let reasoningEffort =
+      matched?.reasoningEffort ??
+      activeProfile?.defaultReasoningEffort ??
+      entry?.defaultEffort ??
+      (!activeProfile && (!model || model === activeRuntime.defaultModel)
+        ? activeRuntime.defaultReasoningEffort
+        : undefined)
+    if (entry?.reasoningEfforts !== undefined) {
+      if (entry.reasoningEfforts.length === 0) {
+        reasoningEffort = undefined
+      } else if (reasoningEffort && !entry.reasoningEfforts.includes(reasoningEffort)) {
+        reasoningEffort = entry.defaultEffort
+      }
     }
     return {
       provider,
@@ -326,14 +384,25 @@ export class ExternalAgent implements Agent {
 
   private async ensureDriver(model: string, reasoningEffort?: string): Promise<ExternalRuntimeDriver> {
     const activeRuntime = this.runtime
-    if (!this.driver || this.driverRuntimeId !== activeRuntime.id) {
+    const activeProfile = this.resolveActiveProfile(activeRuntime)
+    const runtimeKey = activeProfile ? `${activeRuntime.id}#${activeProfile.id}` : activeRuntime.id
+    if (!this.driver || this.driverRuntimeKey !== runtimeKey) {
       if (this.driver) {
         await this.driver.close().catch(() => {})
       }
-      this.driver = activeRuntime.createDriver({ ctx: this.rootCtx, agent: this })
-      this.driverRuntimeId = activeRuntime.id
+      this.driver = activeRuntime.createDriver({
+        ctx: this.rootCtx,
+        agent: this,
+        ...(activeProfile ? { profile: activeProfile } : {}),
+      })
+      this.driverRuntimeKey = runtimeKey
     }
-    const persistedId = readPersistedExternalId(this.session, activeRuntime.id)
+    const bindingDriverKey = activeRuntime.parentRuntimeId ?? activeRuntime.id
+    const persistedId =
+      readPersistedExternalId(this.session, activeRuntime.id) ??
+      (bindingDriverKey !== activeRuntime.id
+        ? readPersistedExternalId(this.session, bindingDriverKey)
+        : undefined)
     const externalId = await this.driver.ensureConnected(persistedId, model, reasoningEffort)
     if (externalId && externalId !== persistedId) {
       appendPluginRecord(this.session, EXTERNAL_BINDING_RECORD_TYPE, {

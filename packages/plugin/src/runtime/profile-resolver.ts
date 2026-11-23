@@ -1,0 +1,327 @@
+import { existsSync, readFileSync } from 'node:fs'
+import { join } from 'node:path'
+import type {
+  ExternalRuntimeAuthMethod,
+  ExternalRuntimeProfile,
+  ExternalRuntimeProfileCapabilities,
+  RuntimeArgsMode,
+} from '../types.js'
+import { buildRuntimeEnv, resolveRuntimeCommand, type ExternalRuntimeSpec } from './config.js'
+import { expandUserPath } from './profile-store.js'
+import { flattenTomlToCodexConfigArgs, parseTomlDocument } from './toml-subset.js'
+
+const PATH_LIKE_ENV_KEYS = new Set(['CODEX_HOME', 'TRAE_HOME', 'CLAUDE_CONFIG_DIR', 'XDG_CONFIG_HOME'])
+
+const AGY_DEFAULT_AUTH_METHODS: readonly ExternalRuntimeAuthMethod[] = [
+  { id: 'oauth-personal', name: 'Google 个人账号', description: '使用本机已登录的个人 Google 账号' },
+  { id: 'oauth-business', name: 'Gemini Enterprise', description: '使用 Gemini Enterprise 企业账号' },
+  { id: 'gemini-api-key', name: 'Gemini API Key', description: '使用 GEMINI_API_KEY 与 GOOGLE_GEMINI_BASE_URL' },
+  { id: 'agent-platform', name: 'Agent Platform (ADC)', description: '使用 Vertex AI / ADC 凭据' },
+]
+
+export interface ResolvedRuntimeLaunchPlan {
+  readonly command: string
+  readonly args: readonly string[]
+  readonly env: NodeJS.ProcessEnv
+  readonly authMethodId?: string
+  readonly defaultModel?: string
+  readonly defaultReasoningEffort?: string
+}
+
+export function resolveProfileCapabilities(
+  spec: ExternalRuntimeSpec,
+  liveAuthMethods?: readonly ExternalRuntimeAuthMethod[],
+): ExternalRuntimeProfileCapabilities {
+  if (spec.id === 'codex') {
+    return {
+      supportsCliProfile: true,
+      cliProfileHint: '例如 personal（对应 ~/.codex/<name>.config.toml 或 config.toml 中的 [profiles.<name>]）',
+      supportsConfigFile: true,
+      configFileHint: '~/.codex/personal.config.toml',
+      supportsEnv: true,
+      envHints: ['CODEX_HOME', 'OPENAI_BASE_URL', 'OPENAI_API_KEY'],
+      supportsArgs: true,
+      supportsAuthMethod: false,
+      supportsExposeAsPreset: true,
+    }
+  }
+  if (spec.id === 'trae') {
+    return {
+      supportsCliProfile: true,
+      cliProfileHint: '例如 work（对应 ~/.trae/<name>.traecli.toml）',
+      supportsConfigFile: true,
+      configFileHint: '~/.trae/work.traecli.toml',
+      supportsEnv: true,
+      envHints: ['TRAE_HOME'],
+      supportsArgs: true,
+      supportsAuthMethod: false,
+      supportsExposeAsPreset: true,
+    }
+  }
+  if (spec.id === 'agy') {
+    return {
+      supportsCliProfile: false,
+      supportsConfigFile: true,
+      configFileHint: '~/.config/proxy/agy/settings.json',
+      supportsEnv: true,
+      envHints: ['GOOGLE_GEMINI_BASE_URL', 'GEMINI_API_KEY'],
+      supportsArgs: true,
+      supportsAuthMethod: true,
+      authMethods: liveAuthMethods && liveAuthMethods.length > 0 ? liveAuthMethods : AGY_DEFAULT_AUTH_METHODS,
+      supportsExposeAsPreset: true,
+    }
+  }
+  if (spec.id === 'claude-code') {
+    return {
+      supportsCliProfile: false,
+      supportsConfigFile: false,
+      supportsEnv: true,
+      envHints: ['ANTHROPIC_BASE_URL', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CONFIG_DIR'],
+      supportsArgs: true,
+      supportsAuthMethod: false,
+      supportsExposeAsPreset: true,
+    }
+  }
+  if (spec.kind === 'codex-app-server') {
+    return {
+      supportsCliProfile: true,
+      supportsConfigFile: true,
+      supportsEnv: true,
+      envHints: [],
+      supportsArgs: true,
+      supportsAuthMethod: false,
+      supportsExposeAsPreset: true,
+    }
+  }
+  return {
+    supportsCliProfile: false,
+    supportsConfigFile: false,
+    supportsEnv: true,
+    envHints: [],
+    supportsArgs: true,
+    supportsAuthMethod: Boolean(liveAuthMethods && liveAuthMethods.length > 0),
+    ...(liveAuthMethods && liveAuthMethods.length > 0 ? { authMethods: liveAuthMethods } : {}),
+    supportsExposeAsPreset: true,
+  }
+}
+
+function expandProfileEnv(raw?: Readonly<Record<string, string>>): Record<string, string> {
+  if (!raw) return {}
+  const out: Record<string, string> = {}
+  for (const [key, val] of Object.entries(raw)) {
+    const cleanKey = key.trim()
+    if (!cleanKey) continue
+    out[cleanKey] =
+      PATH_LIKE_ENV_KEYS.has(cleanKey) && (val === '~' || val.startsWith('~/') || val.startsWith('~\\'))
+        ? expandUserPath(val)
+        : val
+  }
+  return out
+}
+
+function mergeExtraArgs(
+  baseArgs: readonly string[],
+  extraArgs?: readonly string[],
+  argsMode: RuntimeArgsMode = 'append',
+): string[] {
+  if (!extraArgs || extraArgs.length === 0) return [...baseArgs]
+  if (argsMode === 'replace') return [...extraArgs]
+  if (argsMode === 'prepend') return [...extraArgs, ...baseArgs]
+  return [...baseArgs, ...extraArgs]
+}
+
+/**
+ * Parse human-readable or slug model labels from Antigravity `settings.json`,
+ * e.g. `"Gemini 4 Carbon (Medium)"` -> `{ model: 'gemini-4-carbon', effort: 'medium' }`.
+ */
+export function parseAgySettingsModel(
+  rawModel: string,
+): { readonly model: string; readonly effort?: string } | undefined {
+  const trimmed = rawModel.trim()
+  if (!trimmed) return undefined
+  const parenMatch = /^(.+?)\s*\((low|medium|high|xhigh|max|ultra)\)\s*$/i.exec(trimmed)
+  if (parenMatch) {
+    const slug = parenMatch[1]!.trim().toLowerCase().replace(/\s+/g, '-')
+    return { model: slug, effort: parenMatch[2]!.toLowerCase() }
+  }
+  const slugMatch = /^([a-z0-9][a-z0-9._-]*)-(low|medium|high|xhigh|max|ultra)$/i.exec(trimmed)
+  if (slugMatch) {
+    return { model: slugMatch[1]!.toLowerCase(), effort: slugMatch[2]!.toLowerCase() }
+  }
+  return { model: trimmed.toLowerCase().replace(/\s+/g, '-') }
+}
+
+function readAgySettingsFile(filePath: string): {
+  readonly modelProvider?: string
+  readonly model?: string
+  readonly effort?: string
+} {
+  if (!existsSync(filePath)) return {}
+  try {
+    const parsed = JSON.parse(readFileSync(filePath, 'utf8')) as Record<string, unknown>
+    const modelProvider =
+      typeof parsed.modelProvider === 'string' && parsed.modelProvider.trim()
+        ? parsed.modelProvider.trim().toLowerCase()
+        : undefined
+    const modelParsed = typeof parsed.model === 'string' ? parseAgySettingsModel(parsed.model) : undefined
+    return {
+      ...(modelProvider ? { modelProvider } : {}),
+      ...(modelParsed?.model ? { model: modelParsed.model } : {}),
+      ...(modelParsed?.effort ? { effort: modelParsed.effort } : {}),
+    }
+  } catch {
+    return {}
+  }
+}
+
+function resolveCodexAppServerPlan(
+  spec: ExternalRuntimeSpec,
+  profile: ExternalRuntimeProfile,
+  env: NodeJS.ProcessEnv,
+): ResolvedRuntimeLaunchPlan {
+  const command = resolveRuntimeCommand(spec, env)
+  let args = [...spec.args]
+  let inferredModel: string | undefined
+  let inferredEffort: string | undefined
+
+  const isTrae = spec.id === 'trae'
+  const explicitConfigPath = profile.configFile ? expandUserPath(profile.configFile) : undefined
+
+  if (isTrae && profile.cliProfile && !explicitConfigPath && profile.argsMode !== 'replace') {
+    // TRAE CLI natively accepts `-p <profile>` before `app-server`.
+    args = ['-p', profile.cliProfile, ...args]
+  } else {
+    // Codex `app-server` rejects top-level `-p/--profile`; flatten the TOML layer into `-c` flags.
+    // Supports standalone `<name>.config.toml` as well as `[profiles.<name>]` in `config.toml`.
+    let resolvedDoc: Record<string, unknown> | undefined
+    if (explicitConfigPath) {
+      if (!existsSync(explicitConfigPath)) {
+        throw new Error(`配置文件不存在：${profile.configFile || explicitConfigPath}`)
+      }
+      resolvedDoc = parseTomlDocument(readFileSync(explicitConfigPath, 'utf8'))
+    } else if (profile.cliProfile) {
+      const homeDir = isTrae
+        ? expandUserPath(env.TRAE_HOME || '~/.trae')
+        : expandUserPath(env.CODEX_HOME || '~/.codex')
+      const ext = isTrae ? '.traecli.toml' : '.config.toml'
+      const standalonePath = join(homeDir, `${profile.cliProfile}${ext}`)
+      if (existsSync(standalonePath)) {
+        resolvedDoc = parseTomlDocument(readFileSync(standalonePath, 'utf8'))
+      } else if (!isTrae) {
+        const mainConfigPath = join(homeDir, 'config.toml')
+        if (existsSync(mainConfigPath)) {
+          const mainDoc = parseTomlDocument(readFileSync(mainConfigPath, 'utf8'))
+          const profilesTable = mainDoc.profiles
+          if (profilesTable && typeof profilesTable === 'object' && !Array.isArray(profilesTable)) {
+            const section = (profilesTable as Record<string, unknown>)[profile.cliProfile]
+            if (section && typeof section === 'object' && !Array.isArray(section)) {
+              resolvedDoc = section as Record<string, unknown>
+            }
+          }
+        }
+      }
+      if (!resolvedDoc) {
+        throw new Error(`未找到配置 "${profile.cliProfile}"（已检查 ${standalonePath}${!isTrae ? ' 及 config.toml [profiles.*]' : ''}）`)
+      }
+    }
+
+    if (resolvedDoc) {
+      if (typeof resolvedDoc.model === 'string' && resolvedDoc.model.trim()) {
+        inferredModel = resolvedDoc.model.trim()
+      }
+      if (typeof resolvedDoc.model_reasoning_effort === 'string' && resolvedDoc.model_reasoning_effort.trim()) {
+        inferredEffort = resolvedDoc.model_reasoning_effort.trim()
+      }
+      if (profile.argsMode !== 'replace') {
+        args = [...args, ...flattenTomlToCodexConfigArgs(resolvedDoc as never)]
+      }
+    }
+  }
+
+  args = mergeExtraArgs(args, profile.args, profile.argsMode ?? 'append')
+  const defaultModel = profile.defaultModel || inferredModel
+  const defaultReasoningEffort = profile.defaultReasoningEffort || inferredEffort
+
+  return {
+    command,
+    args,
+    env,
+    ...(defaultModel ? { defaultModel } : {}),
+    ...(defaultReasoningEffort ? { defaultReasoningEffort } : {}),
+  }
+}
+
+function resolveAcpPlan(
+  spec: ExternalRuntimeSpec,
+  profile: ExternalRuntimeProfile,
+  env: NodeJS.ProcessEnv,
+): ResolvedRuntimeLaunchPlan {
+  const command = resolveRuntimeCommand(spec, env)
+  let args = [...spec.args]
+  let authMethodId = profile.authMethodId?.trim() || undefined
+  let inferredModel: string | undefined
+  let inferredEffort: string | undefined
+
+  if (spec.id === 'agy') {
+    if (profile.configFile) {
+      const expandedSettings = expandUserPath(profile.configFile)
+      if (!existsSync(expandedSettings)) {
+        throw new Error(`配置文件不存在：${profile.configFile}`)
+      }
+      // `--settings` is a top-level `agy` flag and MUST precede `acp`.
+      if (profile.argsMode !== 'replace') {
+        args = ['--settings', expandedSettings, ...args]
+      }
+      const settingsMeta = readAgySettingsFile(expandedSettings)
+      if (!authMethodId && settingsMeta.modelProvider === 'gemini') {
+        authMethodId = 'gemini-api-key'
+      }
+      inferredModel = settingsMeta.model
+      inferredEffort = settingsMeta.effort
+    }
+    if (!authMethodId && profile.env?.GEMINI_API_KEY?.trim()) {
+      authMethodId = 'gemini-api-key'
+    }
+  }
+
+  args = mergeExtraArgs(args, profile.args, profile.argsMode ?? 'append')
+  const defaultModel = profile.defaultModel || inferredModel
+  const defaultReasoningEffort = profile.defaultReasoningEffort || inferredEffort
+
+  return {
+    command,
+    args,
+    env,
+    ...(authMethodId ? { authMethodId } : {}),
+    ...(defaultModel ? { defaultModel } : {}),
+    ...(defaultReasoningEffort ? { defaultReasoningEffort } : {}),
+  }
+}
+
+/**
+ * Translate a runtime spec + optional launch profile into exact `spawn()` arguments,
+ * merged environment, and optional ACP `authenticate` method id.
+ */
+export function resolveRuntimeLaunchPlan(
+  spec: ExternalRuntimeSpec,
+  profile?: ExternalRuntimeProfile,
+  extraEnv?: Readonly<Record<string, string>>,
+): ResolvedRuntimeLaunchPlan {
+  const profileEnv = expandProfileEnv(profile?.env)
+  const env = buildRuntimeEnv(spec, { ...profileEnv, ...(extraEnv ?? {}) })
+
+  if (!profile) {
+    return {
+      command: resolveRuntimeCommand(spec, env),
+      args: spec.args,
+      env,
+      ...(spec.defaultModel ? { defaultModel: spec.defaultModel } : {}),
+      ...(spec.defaultReasoningEffort ? { defaultReasoningEffort: spec.defaultReasoningEffort } : {}),
+    }
+  }
+
+  if (spec.kind === 'codex-app-server') {
+    return resolveCodexAppServerPlan(spec, profile, env)
+  }
+  return resolveAcpPlan(spec, profile, env)
+}

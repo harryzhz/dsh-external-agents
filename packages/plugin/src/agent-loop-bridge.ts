@@ -178,7 +178,10 @@ export async function syncBlankSessionModelToPreset(
 
   // Native preset selected: if the inherited default belongs to an external CLI provider,
   // switch the blank session to the first configured native LLM model when available.
-  const externalProviders = new Set(registry.list().map((r) => r.providerId))
+  const externalProviders = new Set([
+    ...registry.list().map((r) => r.providerId),
+    ...registry.listExposedPresets().map((r) => r.providerId),
+  ])
   const current = initialAgent.model.current()
   const inheritedProvider = current?.provider ?? initialAgent.options.provider
   if (!inheritedProvider || !externalProviders.has(inheritedProvider)) return
@@ -215,6 +218,7 @@ export function createExternalAgentRouter(
       id: session.id,
       runtime,
       resolveRuntime: (s) => registry.resolve(effectivePresetOfSession(s.header, s.snapshotEvents())),
+      resolveProfile: (runtimeId, profileId) => registry.getProfile(runtimeId, profileId),
       idleEvictMs,
       options: agentOptions,
       session,
@@ -223,7 +227,10 @@ export function createExternalAgentRouter(
         inbox: captured.inboxProjection.readerFor(session),
       },
       lastTurn,
-      resolveCatalogModels: (providerId) => registry.listModelsForProvider(providerId),
+      resolveCatalogModels: (providerId, runtimeId, profileId) =>
+        runtimeId && profileId
+          ? registry.listModelsForRuntime(runtimeId, profileId)
+          : registry.listModelsForProvider(providerId),
     })
 
     let detachAgent: (() => void) | undefined
