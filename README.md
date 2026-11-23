@@ -133,4 +133,4 @@ dsh plugin --profile web add "file:$(pwd)"
 
 ## License
 
-本项目采用非商业软件许可协议（详见 [LICENSE](./LICENSE)）：允许在**非商业、非盈利**场景下自由使用、修改、二次开发与分发；**禁止用于任何商业用途或盈利行为**。如需商业授权请联系作者。
+[MIT](./LICENSE)
