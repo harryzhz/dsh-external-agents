@@ -3,6 +3,7 @@ dist/
 *.tsbuildinfo
 .DS_Store
 .local/
+.worktrees/
 coverage/
 *.log
 
