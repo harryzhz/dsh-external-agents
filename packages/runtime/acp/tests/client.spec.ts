@@ -4,6 +4,7 @@ import {
   AcpRuntimeClient,
   normalizeAcpPermissionRequest,
   normalizeAcpSessionUpdate,
+  parseAcpCatalog,
   stripSshSessionEnv,
   type AcpActiveToolCall,
   type AcpJsonRpcMessage,
@@ -913,5 +914,277 @@ describe('AcpRuntimeClient model config options', () => {
     })
     await expect(badClient.startOrResume()).rejects.toThrow(/unsupported authMethod "nonexistent-method"/)
     await badClient.close()
+  })
+
+  it('auto-authenticates with the first advertised authMethod when session open fails with ACP -32000', async () => {
+    let authed = false
+    const transport = new MockAcpTransport((msg, t) => {
+      if (msg.method === 'initialize') {
+        t.emit({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            protocolVersion: 1,
+            agentCapabilities: { loadSession: true, sessionCapabilities: { resume: {} } },
+            authMethods: [
+              { id: 'oauth-personal', name: 'Log in with Google' },
+              { id: 'gemini-api-key', name: 'Gemini API key' },
+            ],
+          },
+        })
+      } else if (msg.method === 'authenticate') {
+        authed = true
+        t.emit({ jsonrpc: '2.0', id: msg.id, result: {} })
+      } else if (msg.method === 'session/new' || msg.method === 'session/resume') {
+        if (!authed) {
+          t.emit({
+            jsonrpc: '2.0',
+            id: msg.id,
+            error: { code: -32000, message: 'Authentication required' },
+          })
+          return
+        }
+        t.emit({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            sessionId: msg.method === 'session/resume' ? 'acp_resumed' : 'acp_default_auth',
+            models: {
+              currentModelId: 'gemini-4-neon-high',
+              availableModels: [{ modelId: 'gemini-4-neon-high', name: 'Gemini 4 Neon (High)' }],
+            },
+          },
+        })
+      }
+    })
+
+    const logs: string[] = []
+    const client = new AcpRuntimeClient({
+      cwd: '/repo',
+      command: 'agy',
+      args: ['acp', '--stdio'],
+      logger: (m) => logs.push(m),
+      transportFactory: () => transport,
+    })
+
+    const sid = await client.startOrResume()
+    expect(sid).toBe('acp_default_auth')
+    expect(transport.sent.map((m) => m.method)).toEqual([
+      'initialize',
+      'session/new',
+      'authenticate',
+      'session/new',
+    ])
+    expect(transport.sent.find((m) => m.method === 'authenticate')?.params).toEqual({
+      methodId: 'oauth-personal',
+    })
+    expect(logs.some((m) => m.includes('oauth-personal'))).toBe(true)
+    await client.close()
+
+    // Also covers session/resume failing with -32000 before default auth
+    authed = false
+    const resumeTransport = new MockAcpTransport((msg, t) => {
+      if (msg.method === 'initialize') {
+        t.emit({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            protocolVersion: 1,
+            agentCapabilities: { sessionCapabilities: { resume: {} } },
+            authMethods: [{ id: 'oauth-personal', name: 'Log in with Google' }],
+          },
+        })
+      } else if (msg.method === 'authenticate') {
+        authed = true
+        t.emit({ jsonrpc: '2.0', id: msg.id, result: {} })
+      } else if (msg.method === 'session/resume') {
+        if (!authed) {
+          t.emit({ jsonrpc: '2.0', id: msg.id, error: { code: -32000, message: 'Authentication required' } })
+          return
+        }
+        t.emit({ jsonrpc: '2.0', id: msg.id, result: {} })
+      }
+    })
+    const resumeClient = new AcpRuntimeClient({
+      cwd: '/repo',
+      command: 'agy',
+      args: ['acp', '--stdio'],
+      transportFactory: () => resumeTransport,
+    })
+    expect(await resumeClient.startOrResume({ sessionId: 'acp_existing' })).toBe('acp_existing')
+    expect(resumeTransport.sent.map((m) => m.method)).toEqual([
+      'initialize',
+      'session/resume',
+      'authenticate',
+      'session/resume',
+    ])
+    await resumeClient.close()
+  })
+
+  it('does not auto-authenticate on -32000 when authMethods is empty, message is unrelated, or explicit auth already ran', async () => {
+    // 1. Empty authMethods -> surfaces original -32000 error
+    const noMethodsClient = new AcpRuntimeClient({
+      cwd: '/repo',
+      command: 'agent',
+      args: [],
+      transportFactory: () =>
+        new MockAcpTransport((msg, t) => {
+          if (msg.method === 'initialize') t.emit({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1 } })
+          else if (msg.method === 'session/new') {
+            t.emit({ jsonrpc: '2.0', id: msg.id, error: { code: -32000, message: 'Authentication required' } })
+          }
+        }),
+    })
+    await expect(noMethodsClient.startOrResume()).rejects.toMatchObject({ code: -32000 })
+    await noMethodsClient.close()
+
+    // 2. Unrelated -32000 error -> does not invoke authenticate
+    const unrelatedTransport = new MockAcpTransport((msg, t) => {
+      if (msg.method === 'initialize') {
+        t.emit({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { protocolVersion: 1, authMethods: [{ id: 'oauth-personal' }] },
+        })
+      } else if (msg.method === 'session/new') {
+        t.emit({ jsonrpc: '2.0', id: msg.id, error: { code: -32000, message: 'Workspace locked' } })
+      }
+    })
+    const unrelatedClient = new AcpRuntimeClient({
+      cwd: '/repo',
+      command: 'agent',
+      args: [],
+      transportFactory: () => unrelatedTransport,
+    })
+    await expect(unrelatedClient.startOrResume()).rejects.toThrow('Workspace locked')
+    expect(unrelatedTransport.sent.map((m) => m.method)).toEqual(['initialize', 'session/new'])
+    await unrelatedClient.close()
+
+    // 3. Explicit authMethodId already ran and session/new still returns -32000 -> no silent retry
+    const explicitTransport = new MockAcpTransport((msg, t) => {
+      if (msg.method === 'initialize') {
+        t.emit({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            protocolVersion: 1,
+            authMethods: [{ id: 'oauth-personal' }, { id: 'gemini-api-key' }],
+          },
+        })
+      } else if (msg.method === 'authenticate') {
+        t.emit({ jsonrpc: '2.0', id: msg.id, result: {} })
+      } else if (msg.method === 'session/new') {
+        t.emit({ jsonrpc: '2.0', id: msg.id, error: { code: -32000, message: 'Authentication required' } })
+      }
+    })
+    const explicitClient = new AcpRuntimeClient({
+      cwd: '/repo',
+      command: 'agent',
+      args: [],
+      authMethodId: 'gemini-api-key',
+      transportFactory: () => explicitTransport,
+    })
+    await expect(explicitClient.startOrResume()).rejects.toMatchObject({ code: -32000 })
+    expect(explicitTransport.sent.map((m) => m.method)).toEqual(['initialize', 'authenticate', 'session/new'])
+    await explicitClient.close()
+  })
+
+  it('forwards sessionMeta as _meta on session/new, session/resume, and session/load', async () => {
+    const sentMeta: Array<{ method: string; meta: unknown }> = []
+    const transport = new MockAcpTransport((msg, t) => {
+      if (msg.method === 'initialize') {
+        t.emit({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            protocolVersion: 1,
+            agentCapabilities: { loadSession: true, sessionCapabilities: { resume: {} } },
+          },
+        })
+      } else if (msg.method === 'session/resume') {
+        sentMeta.push({ method: msg.method, meta: (msg.params as Record<string, unknown>)?._meta })
+        t.emit({ jsonrpc: '2.0', id: msg.id, error: { code: -32002, message: 'Session not found' } })
+      } else if (msg.method === 'session/new') {
+        sentMeta.push({ method: msg.method, meta: (msg.params as Record<string, unknown>)?._meta })
+        t.emit({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 'acp_meta_1' } })
+      }
+    })
+
+    const sessionMeta = {
+      customAgent: { options: { settings: { env: { EXAMPLE_BASE_URL: 'http://127.0.0.1:9000' } } } },
+    }
+    const client = new AcpRuntimeClient({
+      cwd: '/repo',
+      command: 'agent',
+      args: [],
+      sessionMeta,
+      transportFactory: () => transport,
+    })
+
+    const sid = await client.startOrResume({ sessionId: 'stale_id' })
+    expect(sid).toBe('acp_meta_1')
+    expect(sentMeta).toEqual([
+      { method: 'session/resume', meta: sessionMeta },
+      { method: 'session/new', meta: sessionMeta },
+    ])
+    await client.close()
+  })
+
+  it('preserves configOptions thoughtLevels when legacy models.availableModels has no pre-multiplied suffixes', () => {
+    const snap = parseAcpCatalog({
+      models: {
+        currentModelId: 'default',
+        availableModels: [
+          { modelId: 'default', name: 'Default' },
+          { modelId: 'sonnet', name: 'Sonnet' },
+        ],
+      },
+      configOptions: [
+        {
+          id: 'model',
+          category: 'model',
+          type: 'select',
+          currentValue: 'default',
+          options: [
+            { value: 'default', name: 'Default' },
+            { value: 'sonnet', name: 'Sonnet' },
+          ],
+        },
+        {
+          id: 'effort',
+          category: 'thought_level',
+          type: 'select',
+          currentValue: 'medium',
+          options: [
+            { value: 'default', name: 'Default' },
+            { value: 'low', name: 'Low' },
+            { value: 'medium', name: 'Medium' },
+            { value: 'high', name: 'High' },
+          ],
+        },
+      ],
+    })
+    expect(snap.models).toEqual([
+      {
+        id: 'default',
+        name: 'Default',
+        thoughtLevels: [
+          { id: 'low', name: 'Low' },
+          { id: 'medium', name: 'Medium' },
+          { id: 'high', name: 'High' },
+        ],
+        defaultThoughtLevel: 'medium',
+      },
+      {
+        id: 'sonnet',
+        name: 'Sonnet',
+        thoughtLevels: [
+          { id: 'low', name: 'Low' },
+          { id: 'medium', name: 'Medium' },
+          { id: 'high', name: 'High' },
+        ],
+        defaultThoughtLevel: 'medium',
+      },
+    ])
   })
 })

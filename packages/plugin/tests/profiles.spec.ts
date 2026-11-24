@@ -56,6 +56,9 @@ trust_level = "trusted"
 
 [tui]
 status_line = ["model"]
+
+[profiles.other]
+model = "should-not-be-flattened"
 `)
     expect(doc.model_provider).toBe('openai')
     expect(doc.max_tokens).toBe(128000)
@@ -267,14 +270,61 @@ describe('resolveRuntimeLaunchPlan', () => {
     expect(agyPlan.defaultModel).toBe('gemini-4-carbon')
     expect(agyPlan.defaultReasoningEffort).toBe('medium')
 
-    const traePlan = resolveRuntimeLaunchPlan(traeSpec, {
-      id: 'work',
-      runtimeId: 'trae',
-      name: 'Work',
-      source: 'discovered',
-      cliProfile: 'work',
-    })
+    const traeProfilePath = join(dir, 'work.traecli.toml')
+    writeFileSync(traeProfilePath, 'model = "DeepSeek-V4-Pro"\nmodel_reasoning_effort = "medium"\n')
+    const customTraePath = join(dir, 'custom-trae.toml')
+    writeFileSync(customTraePath, 'model = "gpt-5.5"\n')
+
+    const traePlan = resolveRuntimeLaunchPlan(
+      traeSpec,
+      {
+        id: 'work',
+        runtimeId: 'trae',
+        name: 'Work',
+        source: 'discovered',
+        cliProfile: 'work',
+        configFile: traeProfilePath,
+      },
+      { TRAE_HOME: dir },
+    )
     expect(traePlan.args).toEqual(['-p', 'work', 'app-server', '--listen', 'stdio://'])
+    expect(traePlan.defaultModel).toBe('DeepSeek-V4-Pro')
+    expect(traePlan.defaultReasoningEffort).toBe('medium')
+
+    // Non-canonical custom TRAE configFile flattens via -c flags
+    const traeCustomPlan = resolveRuntimeLaunchPlan(
+      traeSpec,
+      {
+        id: 'custom',
+        runtimeId: 'trae',
+        name: 'Custom',
+        source: 'user',
+        configFile: customTraePath,
+      },
+      { TRAE_HOME: dir },
+    )
+    expect(traeCustomPlan.args).toEqual([
+      'app-server',
+      '--listen',
+      'stdio://',
+      '-c',
+      'model="gpt-5.5"',
+    ])
+
+    // Missing TRAE cliProfile fails explicitly instead of letting model/list silently return []
+    expect(() =>
+      resolveRuntimeLaunchPlan(
+        traeSpec,
+        {
+          id: 'missing',
+          runtimeId: 'trae',
+          name: 'Missing',
+          source: 'user',
+          cliProfile: 'nonexistent',
+        },
+        { TRAE_HOME: dir },
+      ),
+    ).toThrow(/未找到配置 "nonexistent"/)
 
     const claudePlan = resolveRuntimeLaunchPlan(claudeSpec, {
       id: 'relay',
@@ -286,6 +336,124 @@ describe('resolveRuntimeLaunchPlan', () => {
     })
     expect(claudePlan.args).toEqual(['-y', '@agentclientprotocol/claude-agent-acp@0.109.0', '--debug'])
     expect(claudePlan.env.ANTHROPIC_BASE_URL).toBe('http://127.0.0.1:9000')
+    expect(claudePlan.sessionMeta).toEqual({
+      claudeCode: {
+        options: {
+          settings: {
+            env: {
+              ANTHROPIC_BASE_URL: 'http://127.0.0.1:9000',
+              ANTHROPIC_API_KEY: 'test-key',
+              ANTHROPIC_AUTH_TOKEN: '',
+              CLAUDE_CODE_USE_BEDROCK: '0',
+              CLAUDE_CODE_USE_VERTEX: '0',
+            },
+          },
+        },
+      },
+    })
+
+    // Claude configFile merges with env and infers defaultModel/effort; CLAUDE_CONFIG_DIR-only omits sessionMeta
+    const claudeSettingsPath = join(dir, 'claude-custom.json')
+    writeFileSync(
+      claudeSettingsPath,
+      JSON.stringify({
+        model: 'sonnet',
+        effortLevel: 'high',
+        env: { ANTHROPIC_BASE_URL: 'http://127.0.0.1:9100', ANTHROPIC_AUTH_TOKEN: 'test-token' },
+      }),
+    )
+    const claudeFilePlan = resolveRuntimeLaunchPlan(claudeSpec, {
+      id: 'file-proxy',
+      runtimeId: 'claude-code',
+      name: 'File Proxy',
+      source: 'user',
+      configFile: claudeSettingsPath,
+    })
+    expect(claudeFilePlan.defaultModel).toBe('sonnet')
+    expect(claudeFilePlan.defaultReasoningEffort).toBe('high')
+    expect(claudeFilePlan.sessionMeta).toEqual({
+      claudeCode: {
+        options: {
+          settings: {
+            model: 'sonnet',
+            effortLevel: 'high',
+            env: {
+              ANTHROPIC_BASE_URL: 'http://127.0.0.1:9100',
+              ANTHROPIC_AUTH_TOKEN: 'test-token',
+              ANTHROPIC_API_KEY: '',
+              CLAUDE_CODE_USE_BEDROCK: '0',
+              CLAUDE_CODE_USE_VERTEX: '0',
+            },
+          },
+        },
+      },
+    })
+    const claudeIsolatedDirPlan = resolveRuntimeLaunchPlan(claudeSpec, {
+      id: 'isolated-dir',
+      runtimeId: 'claude-code',
+      name: 'Isolated Dir',
+      source: 'user',
+      env: { CLAUDE_CONFIG_DIR: dir },
+    })
+    expect(claudeIsolatedDirPlan.sessionMeta).toBeUndefined()
+
+    // Default (no-profile) & GCP Antigravity auth inference
+    const isolatedHome = makeTempDir('agy-isolated-home-')
+    const agyDefaultOauth = resolveRuntimeLaunchPlan(agySpec, undefined, {
+      HOME: isolatedHome,
+      GEMINI_API_KEY: '',
+      GOOGLE_CLOUD_PROJECT: '',
+      GOOGLE_CLOUD_LOCATION: '',
+    })
+    expect(agyDefaultOauth.authMethodId).toBeUndefined()
+
+    const agyDefaultApiKey = resolveRuntimeLaunchPlan(agySpec, undefined, {
+      HOME: isolatedHome,
+      GEMINI_API_KEY: 'test-key',
+      GOOGLE_CLOUD_PROJECT: '',
+      GOOGLE_CLOUD_LOCATION: '',
+    })
+    expect(agyDefaultApiKey.authMethodId).toBe('gemini-api-key')
+
+    const agyDefaultGcp = resolveRuntimeLaunchPlan(agySpec, undefined, {
+      HOME: isolatedHome,
+      GEMINI_API_KEY: '',
+      GOOGLE_CLOUD_PROJECT: 'demo-proj',
+      GOOGLE_CLOUD_LOCATION: 'us-central1',
+    })
+    expect(agyDefaultGcp.authMethodId).toBe('agent-platform')
+
+    const agyGcpSettingsPath = join(dir, 'agy-gcp.json')
+    writeFileSync(
+      agyGcpSettingsPath,
+      JSON.stringify({ gcp: { project: 'demo-proj', location: 'global' } }),
+    )
+    const agyGcpProfile = resolveRuntimeLaunchPlan(
+      agySpec,
+      {
+        id: 'gcp',
+        runtimeId: 'agy',
+        name: 'GCP',
+        source: 'user',
+        configFile: agyGcpSettingsPath,
+      },
+      { HOME: isolatedHome, GEMINI_API_KEY: '' },
+    )
+    expect(agyGcpProfile.authMethodId).toBe('agent-platform')
+
+    // Explicit authMethodId always overrides inferred authMethodId
+    const agyExplicitOverride = resolveRuntimeLaunchPlan(
+      agySpec,
+      {
+        id: 'forced-oauth',
+        runtimeId: 'agy',
+        name: 'Forced OAuth',
+        source: 'user',
+        authMethodId: 'oauth-personal',
+      },
+      { HOME: isolatedHome, GEMINI_API_KEY: 'test-key' },
+    )
+    expect(agyExplicitOverride.authMethodId).toBe('oauth-personal')
 
     expect(parseAgySettingsModel('Gemini 4 Carbon (Medium)')).toEqual({
       model: 'gemini-4-carbon',
@@ -297,6 +465,14 @@ describe('resolveRuntimeLaunchPlan', () => {
       supportsEnv: true,
       supportsArgs: true,
       supportsAuthMethod: true,
+      supportsExposeAsPreset: true,
+    })
+    expect(resolveProfileCapabilities(claudeSpec)).toMatchObject({
+      supportsCliProfile: false,
+      supportsConfigFile: true,
+      supportsEnv: true,
+      supportsArgs: true,
+      supportsAuthMethod: false,
       supportsExposeAsPreset: true,
     })
     expect(resolveProfileCapabilities(codexSpec)).toMatchObject({

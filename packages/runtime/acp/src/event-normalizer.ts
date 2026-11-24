@@ -213,9 +213,17 @@ export function parseAcpCatalog(sessionResult: unknown): AcpCatalogSnapshot {
     const legacyIds = new Set(legacyFlatModels.map((m) => m.id))
     const baseModelIds = new Set(modelOption.values.map((m) => m.id))
     const candidateLevels = buildCandidateThoughtLevels(selectableThoughtLevels)
+    const hasPreMultipliedLegacy =
+      legacyIds.size > 0 &&
+      modelOption.values.some((base) =>
+        candidateLevels.some((lvl) => {
+          const combinedId = `${base.id}-${lvl.id}`
+          return legacyIds.has(combinedId) && !baseModelIds.has(combinedId)
+        }),
+      )
 
     models = modelOption.values.map((base) => {
-      if (legacyIds.size > 0) {
+      if (hasPreMultipliedLegacy) {
         const supported = candidateLevels.filter((lvl) => {
           const combinedId = `${base.id}-${lvl.id}`
           return legacyIds.has(combinedId) && !baseModelIds.has(combinedId)

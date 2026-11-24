@@ -1,4 +1,4 @@
-export { CodexRuntimeClient } from './client.js'
+export { CodexRpcError, CodexRuntimeClient, isThreadNotFoundError } from './client.js'
 export {
   extractCodexTokenUsage,
   normalizeCodexApprovalRequest,

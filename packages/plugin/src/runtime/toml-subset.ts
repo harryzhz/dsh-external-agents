@@ -13,7 +13,7 @@ export type TomlValue =
 
 type MutableTomlObject = Record<string, TomlValue>
 
-const DEFAULT_IGNORED_TOP_LEVEL_KEYS = new Set(['tui', 'notice', 'history'])
+const DEFAULT_IGNORED_TOP_LEVEL_KEYS = new Set(['tui', 'notice', 'history', 'profiles'])
 
 function stripTomlComment(line: string): string {
   let inDouble = false

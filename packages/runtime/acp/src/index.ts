@@ -1,8 +1,10 @@
 export { AcpRuntimeClient } from './client.js'
 export {
+  ACP_AUTH_REQUIRED,
   ACP_RESOURCE_NOT_FOUND,
   AcpRpcError,
   JSON_RPC_METHOD_NOT_FOUND,
+  isAuthRequired,
   isMethodNotFound,
   isResourceNotFound,
 } from './errors.js'
