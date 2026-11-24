@@ -12,7 +12,7 @@ import {
   type ModelSelectionProjectionState,
 } from '@deepseek-ai/dsh-agent'
 import { brandString } from '@deepseek-ai/dsh-brand'
-import type { LlmAttemptId, UserMessage } from '@deepseek-ai/dsh-llm'
+import type { LlmAttemptId, ReasoningEffortId, UserMessage } from '@deepseek-ai/dsh-llm'
 import { createScope, scopeTarget, type Scope } from '@deepseek-ai/dsh-scope'
 import {
   appendPluginRecord,
@@ -23,6 +23,7 @@ import {
 import type { CatalogModelEntry } from './catalog-adapter.js'
 import { ExternalAgentInbox } from './inbox.js'
 import type { ExternalRuntimeDefinition } from './runtime/definition.js'
+import { resolveRuntimeModelSelection } from './runtime/profile-resolver.js'
 import { ExternalStepRecorder } from './step-recorder.js'
 import {
   EXTERNAL_BINDING_RECORD_TYPE,
@@ -220,8 +221,8 @@ export class ExternalAgent implements Agent {
 
   /**
    * The session's current selection applies only when it targets this runtime's
-   * provider; when unset, resolves the live catalog's default model so multi-region
-   * CLIs (e.g. TRAE CN vs TRAE International) never pass a non-existent static default id.
+   * provider; when unset, resolves profile-inferred defaults and the live catalog's
+   * default model before falling back to the base runtime's static default id.
    */
   private async resolveSelection(): Promise<{ provider: string; model: string; reasoningEffort?: string }> {
     const activeRuntime = this.runtime
@@ -229,39 +230,55 @@ export class ExternalAgent implements Agent {
     const current = this.model.current()
     const provider = activeRuntime.providerId
     const matched = current?.provider === provider ? current : undefined
-    let model = matched?.model
-    let catalog: readonly CatalogModelEntry[] | undefined
-    if (!model) {
-      catalog = await this.resolveCatalogModels
-        ?.(provider, activeRuntime.parentRuntimeId ?? activeRuntime.id, activeProfile?.id)
-        .catch(() => undefined)
-      const configured = activeProfile?.defaultModel ?? activeRuntime.defaultModel
-      if (configured && (!catalog || catalog.length === 0 || catalog.some((m) => m.id === configured))) {
-        model = configured
-      } else {
-        model = catalog?.find((m) => m.isDefault)?.id ?? catalog?.[0]?.id ?? configured
+    const catalog = matched?.model
+      ? undefined
+      : await this.resolveCatalogModels
+          ?.(provider, activeRuntime.parentRuntimeId ?? activeRuntime.id, activeProfile?.id)
+          .catch(() => undefined)
+    const profileDefaults = activeProfile
+      ? activeRuntime.resolveProfileDefaults?.(activeProfile) ?? {
+          ...(activeProfile.defaultModel ? { defaultModel: activeProfile.defaultModel } : {}),
+          ...(activeProfile.defaultReasoningEffort
+            ? { defaultReasoningEffort: activeProfile.defaultReasoningEffort }
+            : {}),
+        }
+      : undefined
+    return (
+      resolveRuntimeModelSelection({
+        provider,
+        runtimeDefaultModel: activeRuntime.defaultModel,
+        ...(activeRuntime.defaultReasoningEffort
+          ? { runtimeDefaultReasoningEffort: activeRuntime.defaultReasoningEffort }
+          : {}),
+        hasProfile: Boolean(activeProfile),
+        ...(profileDefaults ? { profileDefaults } : {}),
+        ...(matched ? { matched } : {}),
+        ...(catalog ? { catalog } : {}),
+      }) ?? {
+        provider,
+        model: activeRuntime.defaultModel,
       }
-    }
-    const entry = catalog?.find((m) => m.id === model)
-    let reasoningEffort =
-      matched?.reasoningEffort ??
-      activeProfile?.defaultReasoningEffort ??
-      entry?.defaultEffort ??
-      (!activeProfile && (!model || model === activeRuntime.defaultModel)
-        ? activeRuntime.defaultReasoningEffort
-        : undefined)
-    if (entry?.reasoningEfforts !== undefined) {
-      if (entry.reasoningEfforts.length === 0) {
-        reasoningEffort = undefined
-      } else if (reasoningEffort && !entry.reasoningEfforts.includes(reasoningEffort)) {
-        reasoningEffort = entry.defaultEffort
-      }
-    }
-    return {
-      provider,
-      model,
-      ...(reasoningEffort ? { reasoningEffort } : {}),
-    }
+    )
+  }
+
+  /**
+   * Persist the effective model selection to the session log so cold resumes
+   * (after host restart or driver eviction) recover the exact model/effort
+   * instead of losing in-memory `AgentOptions` and falling back to defaults.
+   */
+  private persistSelection(selection: {
+    readonly provider: string
+    readonly model: string
+    readonly reasoningEffort?: string
+  }): void {
+    if (!selection.provider || !selection.model) return
+    this.model.select({
+      provider: selection.provider,
+      model: selection.model,
+      ...(selection.reasoningEffort
+        ? { reasoningEffort: brandString<ReasoningEffortId>(selection.reasoningEffort) }
+        : {}),
+    })
   }
 
   private async drain(): Promise<void> {
@@ -292,6 +309,7 @@ export class ExternalAgent implements Agent {
     }
 
     const selection = await this.resolveSelection()
+    this.persistSelection(selection)
     const recorder = new ExternalStepRecorder({
       agentId: this.id,
       session: this.session,

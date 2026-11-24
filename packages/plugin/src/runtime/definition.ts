@@ -38,6 +38,9 @@ export interface ExternalRuntimeDefinition extends ExternalRuntimeSummary {
   readonly boundProfile?: ExternalRuntimeProfile
   getProfileCapabilities?(): ExternalRuntimeProfileCapabilities
   getLiveAuthMethods?(): readonly ExternalRuntimeAuthMethod[] | undefined
+  resolveProfileDefaults?(
+    profile: ExternalRuntimeProfile,
+  ): { readonly defaultModel?: string; readonly defaultReasoningEffort?: string }
   probeModels(profile?: ExternalRuntimeProfile): Promise<readonly CatalogModelEntry[]>
   createDriver(host: ExternalRuntimeHost): ExternalRuntimeDriver
 }

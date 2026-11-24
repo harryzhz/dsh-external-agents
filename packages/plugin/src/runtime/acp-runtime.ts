@@ -27,7 +27,11 @@ import {
 } from './config.js'
 import { toRuntimeSummary, type ExternalRuntimeDefinition } from './definition.js'
 import { readImageSource } from './message-content.js'
-import { resolveProfileCapabilities, resolveRuntimeLaunchPlan } from './profile-resolver.js'
+import {
+  resolveProfileCapabilities,
+  resolveProfileDefaults,
+  resolveRuntimeLaunchPlan,
+} from './profile-resolver.js'
 
 function extractAcpPromptBlocks(messages: readonly UserMessage[]): AcpPromptBlock[] {
   const blocks: AcpPromptBlock[] = []
@@ -164,6 +168,7 @@ export function createAcpRuntime(spec: ExternalRuntimeSpec): ExternalRuntimeDefi
     fallbackModels: spec.fallbackModels,
     getLiveAuthMethods: () => cachedAuthMethods,
     getProfileCapabilities: () => resolveProfileCapabilities(spec, cachedAuthMethods),
+    resolveProfileDefaults: (profile) => resolveProfileDefaults(spec, profile),
     async probeModels(profile?: ExternalRuntimeProfile): Promise<readonly CatalogModelEntry[]> {
       const plan = resolveRuntimeLaunchPlan(spec, profile)
       const snapshot = await AcpRuntimeClient.probeCatalog({
