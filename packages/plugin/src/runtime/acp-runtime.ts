@@ -26,21 +26,25 @@ import {
   type ExternalRuntimeSpec,
 } from './config.js'
 import { toRuntimeSummary, type ExternalRuntimeDefinition } from './definition.js'
-import { readImageSource } from './message-content.js'
+import { resolveImageSource } from './message-content.js'
 import {
   resolveProfileCapabilities,
   resolveProfileDefaults,
   resolveRuntimeLaunchPlan,
 } from './profile-resolver.js'
 
-function extractAcpPromptBlocks(messages: readonly UserMessage[]): AcpPromptBlock[] {
+async function extractAcpPromptBlocks(
+  ctx: Context,
+  messages: readonly UserMessage[],
+  signal: AbortSignal,
+): Promise<AcpPromptBlock[]> {
   const blocks: AcpPromptBlock[] = []
   for (const message of messages) {
     for (const block of message.content) {
       if (block.type === 'text' && block.text.length > 0) {
         blocks.push({ type: 'text', text: block.text })
       } else if (block.type === 'image') {
-        const source = readImageSource(block)
+        const source = await resolveImageSource(ctx, block, { signal })
         if (source.data) {
           blocks.push({ type: 'image', mimeType: source.mimeType, data: source.data })
         }
@@ -140,8 +144,9 @@ class AcpDriverAdapter implements ExternalRuntimeDriver {
       }
       await this.client.setThoughtLevel(request.reasoningEffort ?? '')
     }
+    const promptBlocks = await extractAcpPromptBlocks(this.ctx, request.messages, signal)
     const res = await this.client.runTurn(
-      extractAcpPromptBlocks(request.messages),
+      promptBlocks,
       {
         onEvent,
         onPermission: (req, sig) => bridgeAcpPermission(this.ctx, this.agent, req, sig),
