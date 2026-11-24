@@ -6,6 +6,7 @@ import { resolveRuntimeSpecs } from '../src/runtime/config.js'
 import {
   parseAgySettingsModel,
   resolveProfileCapabilities,
+  resolveProfileDefaults,
   resolveRuntimeLaunchPlan,
 } from '../src/runtime/profile-resolver.js'
 import {
@@ -363,5 +364,84 @@ describe('ExternalRuntimeRegistry dynamic exposed profile presets', () => {
     // Deleting removes profile completely
     expect(await registry.deleteProfile('agy', 'ark')).toBe(true)
     expect(registry.getProfile('agy', 'ark')).toBeUndefined()
+  })
+
+  it('infers exposed profile defaultModel & defaultReasoningEffort from settings.json without falling back to base defaultModel', async () => {
+    const dir = makeTempDir('registry-profile-defaults-')
+    const agySettingsPath = join(dir, 'settings.json')
+    writeFileSync(
+      agySettingsPath,
+      JSON.stringify({ modelProvider: 'gemini', model: 'Gemini 4 Carbon (Medium)' }),
+    )
+
+    const agySpec = resolveRuntimeSpecs([]).find((s) => s.id === 'agy')!
+    expect(
+      resolveProfileDefaults(agySpec, {
+        id: 'demo-proxy',
+        runtimeId: 'agy',
+        name: 'Demo Proxy',
+        source: 'user',
+        configFile: agySettingsPath,
+      }),
+    ).toEqual({ defaultModel: 'gemini-4-carbon', defaultReasoningEffort: 'medium' })
+    // Missing configFile must degrade gracefully without throwing
+    expect(
+      resolveProfileDefaults(agySpec, {
+        id: 'missing',
+        runtimeId: 'agy',
+        name: 'Missing',
+        source: 'user',
+        configFile: join(dir, 'missing.json'),
+      }),
+    ).toEqual({})
+
+    const registry = createExternalRuntimeRegistry([], {
+      dataDir: dir,
+      enableDiscovery: false,
+    })
+
+    await registry.upsertProfile({
+      id: 'demo-proxy',
+      runtimeId: 'agy',
+      name: 'Demo Proxy',
+      configFile: agySettingsPath,
+      env: { GOOGLE_GEMINI_BASE_URL: 'http://127.0.0.1:8787', GEMINI_API_KEY: 'test-token' },
+      exposeAsPreset: true,
+    })
+
+    // Derived preset reflects settings.json defaults instead of base agy's gemini-4-neon / high
+    const derived = registry.resolve('agy:demo-proxy')
+    expect(derived?.defaultModel).toBe('gemini-4-carbon')
+    expect(derived?.defaultReasoningEffort).toBe('medium')
+
+    // Even when live catalog includes base runtime's gemini-4-neon alongside gemini-4-carbon,
+    // resolveDefaultSelection selects gemini-4-carbon (medium) for both base+profile and exposed preset
+    const agyDef = registry.resolve('agy')!
+    vi.spyOn(agyDef, 'probeModels').mockResolvedValue([
+      {
+        id: 'gemini-4-neon',
+        name: 'Gemini 4 Neon',
+        reasoningEfforts: ['low', 'medium', 'high', 'xhigh'],
+        defaultEffort: 'high',
+      },
+      {
+        id: 'gemini-4-carbon',
+        name: 'Gemini 4 Carbon',
+        isDefault: true,
+        reasoningEfforts: ['low', 'medium', 'high'],
+        defaultEffort: 'medium',
+      },
+    ])
+
+    await expect(registry.resolveDefaultSelection('agy', 'demo-proxy')).resolves.toEqual({
+      provider: 'agy-cli',
+      model: 'gemini-4-carbon',
+      reasoningEffort: 'medium',
+    })
+    await expect(registry.resolveDefaultSelection('agy:demo-proxy')).resolves.toEqual({
+      provider: 'agy--demo-proxy-cli',
+      model: 'gemini-4-carbon',
+      reasoningEffort: 'medium',
+    })
   })
 })

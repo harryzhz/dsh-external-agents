@@ -20,6 +20,7 @@ import {
   profileProviderId,
   RuntimeProfileStore,
 } from './profile-store.js'
+import { resolveRuntimeModelSelection } from './profile-resolver.js'
 
 export interface ProfilePresetSyncHandler {
   syncProfilePreset(
@@ -154,32 +155,28 @@ export class ExternalRuntimeRegistry {
     const def = this.resolve(runtimeId)
     if (!def) return undefined
     const baseId = def.parentRuntimeId ?? def.id
+    const baseDef = this.runtimes.get(baseId) ?? def
     const resolvedProfile =
       (profileId ? this.profileStore?.get(baseId, profileId) : undefined) ?? def.boundProfile
     const entries = await this.listModelsForRuntime(def.id, resolvedProfile?.id).catch(() => undefined)
-    const configured = (resolvedProfile?.defaultModel ?? def.defaultModel).trim()
-    let model = configured
-    if (entries && entries.length > 0 && (!configured || !entries.some((m) => m.id === configured))) {
-      model = entries.find((m) => m.isDefault)?.id ?? entries[0]!.id
-    }
-    if (!model) return undefined
-    const entry = entries?.find((m) => m.id === model)
-    let reasoningEffort: string | undefined =
-      resolvedProfile?.defaultReasoningEffort ||
-      entry?.defaultEffort ||
-      (!resolvedProfile ? def.defaultReasoningEffort : undefined)
-    if (entry?.reasoningEfforts !== undefined) {
-      if (entry.reasoningEfforts.length === 0) {
-        reasoningEffort = undefined
-      } else if (reasoningEffort && !entry.reasoningEfforts.includes(reasoningEffort)) {
-        reasoningEffort = entry.defaultEffort
-      }
-    }
-    return {
+    const profileDefaults = resolvedProfile
+      ? baseDef.resolveProfileDefaults?.(resolvedProfile) ?? {
+          ...(resolvedProfile.defaultModel ? { defaultModel: resolvedProfile.defaultModel } : {}),
+          ...(resolvedProfile.defaultReasoningEffort
+            ? { defaultReasoningEffort: resolvedProfile.defaultReasoningEffort }
+            : {}),
+        }
+      : undefined
+    return resolveRuntimeModelSelection({
       provider: def.providerId,
-      model,
-      ...(reasoningEffort ? { reasoningEffort } : {}),
-    }
+      runtimeDefaultModel: baseDef.defaultModel,
+      ...(baseDef.defaultReasoningEffort
+        ? { runtimeDefaultReasoningEffort: baseDef.defaultReasoningEffort }
+        : {}),
+      hasProfile: Boolean(resolvedProfile),
+      ...(profileDefaults ? { profileDefaults } : {}),
+      ...(entries ? { catalog: entries } : {}),
+    })
   }
 
   register(definition: ExternalRuntimeDefinition): void {
@@ -313,19 +310,28 @@ export class ExternalRuntimeRegistry {
     const description =
       profile.description?.trim() ||
       `基于 ${base.displayName} 的启动配置「${profile.name}」`
+    const profileDefaults = base.resolveProfileDefaults?.(profile)
+    const defaultModel = profile.defaultModel || profileDefaults?.defaultModel || base.defaultModel
+    const defaultReasoningEffort =
+      profile.defaultReasoningEffort ||
+      profileDefaults?.defaultReasoningEffort ||
+      (!profile.defaultModel && !profileDefaults?.defaultModel
+        ? base.defaultReasoningEffort
+        : undefined)
     return {
       id,
       displayName,
       description,
       providerId,
-      defaultModel: profile.defaultModel || base.defaultModel,
-      ...(profile.defaultReasoningEffort || base.defaultReasoningEffort
-        ? { defaultReasoningEffort: profile.defaultReasoningEffort || base.defaultReasoningEffort }
-        : {}),
+      defaultModel,
+      ...(defaultReasoningEffort ? { defaultReasoningEffort } : {}),
       fallbackModels: base.fallbackModels,
       parentRuntimeId: base.id,
       profileId: profile.id,
       boundProfile: profile,
+      ...(base.resolveProfileDefaults
+        ? { resolveProfileDefaults: (p) => base.resolveProfileDefaults!(p) }
+        : {}),
       probeModels: () => base.probeModels(profile),
       createDriver: (host) => base.createDriver({ ...host, profile: host.profile ?? profile }),
     }

@@ -26,7 +26,11 @@ import {
 } from './config.js'
 import { toRuntimeSummary, type ExternalRuntimeDefinition } from './definition.js'
 import { extractTextFromMessages, readImageSource } from './message-content.js'
-import { resolveProfileCapabilities, resolveRuntimeLaunchPlan } from './profile-resolver.js'
+import {
+  resolveProfileCapabilities,
+  resolveProfileDefaults,
+  resolveRuntimeLaunchPlan,
+} from './profile-resolver.js'
 
 function extractCodexImages(messages: readonly UserMessage[]): Array<{ url: string }> {
   const images: Array<{ url: string }> = []
@@ -185,6 +189,7 @@ export function createCodexRuntime(spec: ExternalRuntimeSpec): ExternalRuntimeDe
     ...toRuntimeSummary(spec),
     fallbackModels: spec.fallbackModels,
     getProfileCapabilities: () => resolveProfileCapabilities(spec),
+    resolveProfileDefaults: (profile) => resolveProfileDefaults(spec, profile),
     async probeModels(profile?: ExternalRuntimeProfile): Promise<readonly CatalogModelEntry[]> {
       const plan = resolveRuntimeLaunchPlan(spec, profile)
       const models = await CodexRuntimeClient.probeModels({

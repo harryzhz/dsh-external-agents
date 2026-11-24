@@ -252,7 +252,9 @@ export {
 export {
   parseAgySettingsModel,
   resolveProfileCapabilities,
+  resolveProfileDefaults,
   resolveRuntimeLaunchPlan,
+  type ResolvedProfileDefaults,
   type ResolvedRuntimeLaunchPlan,
 } from './runtime/profile-resolver.js'
 export {

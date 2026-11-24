@@ -1,5 +1,6 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
+import type { CatalogModelEntry } from '../catalog-adapter.js'
 import type {
   ExternalRuntimeAuthMethod,
   ExternalRuntimeProfile,
@@ -19,13 +20,16 @@ const AGY_DEFAULT_AUTH_METHODS: readonly ExternalRuntimeAuthMethod[] = [
   { id: 'agent-platform', name: 'Agent Platform (ADC)', description: '使用 Vertex AI / ADC 凭据' },
 ]
 
-export interface ResolvedRuntimeLaunchPlan {
+export interface ResolvedProfileDefaults {
+  readonly defaultModel?: string
+  readonly defaultReasoningEffort?: string
+}
+
+export interface ResolvedRuntimeLaunchPlan extends ResolvedProfileDefaults {
   readonly command: string
   readonly args: readonly string[]
   readonly env: NodeJS.ProcessEnv
   readonly authMethodId?: string
-  readonly defaultModel?: string
-  readonly defaultReasoningEffort?: string
 }
 
 export function resolveProfileCapabilities(
@@ -174,6 +178,188 @@ function readAgySettingsFile(filePath: string): {
   }
 }
 
+function readCodexProfileToml(
+  spec: ExternalRuntimeSpec,
+  profile: ExternalRuntimeProfile,
+  env: NodeJS.ProcessEnv,
+  strict: boolean,
+): Record<string, unknown> | undefined {
+  const isTrae = spec.id === 'trae'
+  const explicitConfigPath = profile.configFile ? expandUserPath(profile.configFile) : undefined
+  if (explicitConfigPath) {
+    if (!existsSync(explicitConfigPath)) {
+      if (strict) {
+        throw new Error(`配置文件不存在：${profile.configFile || explicitConfigPath}`)
+      }
+      return undefined
+    }
+    try {
+      return parseTomlDocument(readFileSync(explicitConfigPath, 'utf8'))
+    } catch (err) {
+      if (strict) throw err
+      return undefined
+    }
+  }
+  if (!profile.cliProfile) return undefined
+
+  const homeDir = isTrae
+    ? expandUserPath(env.TRAE_HOME || '~/.trae')
+    : expandUserPath(env.CODEX_HOME || '~/.codex')
+  const ext = isTrae ? '.traecli.toml' : '.config.toml'
+  const standalonePath = join(homeDir, `${profile.cliProfile}${ext}`)
+  if (existsSync(standalonePath)) {
+    try {
+      return parseTomlDocument(readFileSync(standalonePath, 'utf8'))
+    } catch (err) {
+      if (strict) throw err
+      return undefined
+    }
+  }
+  if (!isTrae) {
+    const mainConfigPath = join(homeDir, 'config.toml')
+    if (existsSync(mainConfigPath)) {
+      try {
+        const mainDoc = parseTomlDocument(readFileSync(mainConfigPath, 'utf8'))
+        const profilesTable = mainDoc.profiles
+        if (profilesTable && typeof profilesTable === 'object' && !Array.isArray(profilesTable)) {
+          const section = (profilesTable as Record<string, unknown>)[profile.cliProfile]
+          if (section && typeof section === 'object' && !Array.isArray(section)) {
+            return section as Record<string, unknown>
+          }
+        }
+      } catch (err) {
+        if (strict) throw err
+        return undefined
+      }
+    }
+  }
+  if (strict) {
+    throw new Error(
+      `未找到配置 "${profile.cliProfile}"（已检查 ${standalonePath}${!isTrae ? ' 及 config.toml [profiles.*]' : ''}）`,
+    )
+  }
+  return undefined
+}
+
+function readTomlModelDefaults(doc: Record<string, unknown> | undefined): ResolvedProfileDefaults {
+  if (!doc) return {}
+  const defaultModel = typeof doc.model === 'string' && doc.model.trim() ? doc.model.trim() : undefined
+  const defaultReasoningEffort =
+    typeof doc.model_reasoning_effort === 'string' && doc.model_reasoning_effort.trim()
+      ? doc.model_reasoning_effort.trim()
+      : undefined
+  return {
+    ...(defaultModel ? { defaultModel } : {}),
+    ...(defaultReasoningEffort ? { defaultReasoningEffort } : {}),
+  }
+}
+
+/**
+ * Best-effort default model & reasoning effort for a launch profile, combining explicit
+ * profile fields with values inferred from the referenced CLI config file (never throws).
+ */
+export function resolveProfileDefaults(
+  spec: ExternalRuntimeSpec,
+  profile?: ExternalRuntimeProfile,
+  extraEnv?: Readonly<Record<string, string>>,
+): ResolvedProfileDefaults {
+  if (!profile) return {}
+  let inferredModel: string | undefined
+  let inferredEffort: string | undefined
+
+  if (!profile.defaultModel || !profile.defaultReasoningEffort) {
+    if (spec.kind === 'codex-app-server') {
+      const profileEnv = expandProfileEnv(profile.env)
+      const env = buildRuntimeEnv(spec, { ...profileEnv, ...(extraEnv ?? {}) })
+      const doc = readCodexProfileToml(spec, profile, env, false)
+      const parsed = readTomlModelDefaults(doc)
+      inferredModel = parsed.defaultModel
+      inferredEffort = parsed.defaultReasoningEffort
+    } else if (spec.id === 'agy' && profile.configFile) {
+      const settingsMeta = readAgySettingsFile(expandUserPath(profile.configFile))
+      inferredModel = settingsMeta.model
+      inferredEffort = settingsMeta.effort
+    }
+  }
+
+  const defaultModel = profile.defaultModel?.trim() || inferredModel
+  const defaultReasoningEffort = profile.defaultReasoningEffort?.trim() || inferredEffort
+  return {
+    ...(defaultModel ? { defaultModel } : {}),
+    ...(defaultReasoningEffort ? { defaultReasoningEffort } : {}),
+  }
+}
+
+export interface RuntimeModelSelectionInput {
+  readonly provider: string
+  readonly runtimeDefaultModel: string
+  readonly runtimeDefaultReasoningEffort?: string
+  readonly hasProfile: boolean
+  readonly profileDefaults?: ResolvedProfileDefaults
+  readonly matched?: { readonly model?: string; readonly reasoningEffort?: string }
+  readonly catalog?: readonly CatalogModelEntry[]
+}
+
+/**
+ * Single source of truth for resolving an external runtime's effective `(provider, model, reasoningEffort)`.
+ * When a launch profile is active, profile-level defaults and the profile's own catalog `isDefault`
+ * take precedence over the parent runtime's static `defaultModel`.
+ */
+export function resolveRuntimeModelSelection(
+  input: RuntimeModelSelectionInput,
+): { readonly provider: string; readonly model: string; readonly reasoningEffort?: string } | undefined {
+  const { provider, hasProfile, profileDefaults, matched, catalog } = input
+  const baseDefault = input.runtimeDefaultModel.trim()
+  const profileModel = profileDefaults?.defaultModel?.trim() || undefined
+  const profileEffort = profileDefaults?.defaultReasoningEffort?.trim() || undefined
+  const hasCatalog = Boolean(catalog && catalog.length > 0)
+  const catalogHas = (id: string | undefined): id is string =>
+    Boolean(id && (!hasCatalog || catalog!.some((m) => m.id === id)))
+
+  let model = matched?.model?.trim() || undefined
+  if (!model) {
+    if (hasProfile) {
+      if (catalogHas(profileModel)) {
+        model = profileModel
+      } else {
+        model =
+          catalog?.find((m) => m.isDefault)?.id ??
+          (catalogHas(baseDefault) ? baseDefault : undefined) ??
+          catalog?.[0]?.id ??
+          profileModel ??
+          baseDefault
+      }
+    } else if (catalogHas(baseDefault)) {
+      model = baseDefault
+    } else {
+      model = catalog?.find((m) => m.isDefault)?.id ?? catalog?.[0]?.id ?? baseDefault
+    }
+  }
+  if (!model) return undefined
+
+  const entry = catalog?.find((m) => m.id === model)
+  const applyProfileEffort = !matched?.model || !profileModel || model === profileModel
+  let reasoningEffort =
+    matched?.reasoningEffort ??
+    (applyProfileEffort ? profileEffort : undefined) ??
+    entry?.defaultEffort ??
+    (!hasProfile && (!model || model === baseDefault)
+      ? input.runtimeDefaultReasoningEffort
+      : undefined)
+  if (entry?.reasoningEfforts !== undefined) {
+    if (entry.reasoningEfforts.length === 0) {
+      reasoningEffort = undefined
+    } else if (reasoningEffort && !entry.reasoningEfforts.includes(reasoningEffort)) {
+      reasoningEffort = entry.defaultEffort
+    }
+  }
+  return {
+    provider,
+    model,
+    ...(reasoningEffort ? { reasoningEffort } : {}),
+  }
+}
+
 function resolveCodexAppServerPlan(
   spec: ExternalRuntimeSpec,
   profile: ExternalRuntimeProfile,
@@ -190,48 +376,17 @@ function resolveCodexAppServerPlan(
   if (isTrae && profile.cliProfile && !explicitConfigPath && profile.argsMode !== 'replace') {
     // TRAE CLI natively accepts `-p <profile>` before `app-server`.
     args = ['-p', profile.cliProfile, ...args]
+    const parsed = readTomlModelDefaults(readCodexProfileToml(spec, profile, env, false))
+    inferredModel = parsed.defaultModel
+    inferredEffort = parsed.defaultReasoningEffort
   } else {
     // Codex `app-server` rejects top-level `-p/--profile`; flatten the TOML layer into `-c` flags.
     // Supports standalone `<name>.config.toml` as well as `[profiles.<name>]` in `config.toml`.
-    let resolvedDoc: Record<string, unknown> | undefined
-    if (explicitConfigPath) {
-      if (!existsSync(explicitConfigPath)) {
-        throw new Error(`配置文件不存在：${profile.configFile || explicitConfigPath}`)
-      }
-      resolvedDoc = parseTomlDocument(readFileSync(explicitConfigPath, 'utf8'))
-    } else if (profile.cliProfile) {
-      const homeDir = isTrae
-        ? expandUserPath(env.TRAE_HOME || '~/.trae')
-        : expandUserPath(env.CODEX_HOME || '~/.codex')
-      const ext = isTrae ? '.traecli.toml' : '.config.toml'
-      const standalonePath = join(homeDir, `${profile.cliProfile}${ext}`)
-      if (existsSync(standalonePath)) {
-        resolvedDoc = parseTomlDocument(readFileSync(standalonePath, 'utf8'))
-      } else if (!isTrae) {
-        const mainConfigPath = join(homeDir, 'config.toml')
-        if (existsSync(mainConfigPath)) {
-          const mainDoc = parseTomlDocument(readFileSync(mainConfigPath, 'utf8'))
-          const profilesTable = mainDoc.profiles
-          if (profilesTable && typeof profilesTable === 'object' && !Array.isArray(profilesTable)) {
-            const section = (profilesTable as Record<string, unknown>)[profile.cliProfile]
-            if (section && typeof section === 'object' && !Array.isArray(section)) {
-              resolvedDoc = section as Record<string, unknown>
-            }
-          }
-        }
-      }
-      if (!resolvedDoc) {
-        throw new Error(`未找到配置 "${profile.cliProfile}"（已检查 ${standalonePath}${!isTrae ? ' 及 config.toml [profiles.*]' : ''}）`)
-      }
-    }
-
+    const resolvedDoc = readCodexProfileToml(spec, profile, env, true)
     if (resolvedDoc) {
-      if (typeof resolvedDoc.model === 'string' && resolvedDoc.model.trim()) {
-        inferredModel = resolvedDoc.model.trim()
-      }
-      if (typeof resolvedDoc.model_reasoning_effort === 'string' && resolvedDoc.model_reasoning_effort.trim()) {
-        inferredEffort = resolvedDoc.model_reasoning_effort.trim()
-      }
+      const parsed = readTomlModelDefaults(resolvedDoc)
+      inferredModel = parsed.defaultModel
+      inferredEffort = parsed.defaultReasoningEffort
       if (profile.argsMode !== 'replace') {
         args = [...args, ...flattenTomlToCodexConfigArgs(resolvedDoc as never)]
       }
