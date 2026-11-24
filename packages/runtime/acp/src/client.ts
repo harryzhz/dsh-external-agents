@@ -27,13 +27,19 @@ import type {
 const DEFAULT_REQUEST_TIMEOUT_MS = 120_000
 /** `initialize` also covers process cold start (e.g. `npx` fetching the agent package). */
 const STARTUP_TIMEOUT_MS = 5 * 60_000
-const PROMPT_TIMEOUT_MS = 30 * 60_000
+/**
+ * Default inactivity timeout for an in-flight `session/prompt` turn.
+ * Unlike a fixed wall-clock deadline, this timer resets on every `session/update`
+ * and pauses while waiting for an interactive permission response so active long
+ * runs are never terminated mid-progress.
+ */
+export const DEFAULT_PROMPT_IDLE_TIMEOUT_MS = 30 * 60_000
 
 interface PendingRequest {
   readonly method: string
   readonly resolve: (result: unknown) => void
   readonly reject: (error: Error) => void
-  readonly timer: ReturnType<typeof setTimeout>
+  timer?: ReturnType<typeof setTimeout>
 }
 
 interface ActiveTurnContext {
@@ -42,6 +48,9 @@ interface ActiveTurnContext {
   readonly activeTools: Map<string, AcpActiveToolCall>
   readonly handlers: AcpTurnHandlers
   readonly abortController: AbortController
+  touchActivity?: () => void
+  pauseIdleTimer?: () => void
+  resumeIdleTimer?: () => void
 }
 
 interface OpenedSession {
@@ -59,6 +68,7 @@ export class AcpRuntimeClient {
   private readonly defaultSessionMeta?: Readonly<Record<string, unknown>>
   private readonly label: string
   private readonly requestTimeoutMs: number
+  private readonly promptIdleTimeoutMs: number
   private readonly clientName: string
   private readonly clientVersion: string
   private readonly logger: (message: string) => void
@@ -86,6 +96,10 @@ export class AcpRuntimeClient {
         : undefined
     this.label = `acp(${options.command})`
     this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS
+    this.promptIdleTimeoutMs =
+      options.promptIdleTimeoutMs !== undefined && Number.isFinite(options.promptIdleTimeoutMs)
+        ? Math.max(0, options.promptIdleTimeoutMs)
+        : DEFAULT_PROMPT_IDLE_TIMEOUT_MS
     this.clientName = options.clientName ?? 'dsh-external-agents'
     this.clientVersion = options.clientVersion ?? '0.1.0'
     this.logger = options.logger ?? (() => {})
@@ -303,10 +317,10 @@ export class AcpRuntimeClient {
     signal?.addEventListener('abort', onExternalAbort, { once: true })
 
     try {
-      const res = (await this.request(
-        'session/prompt',
-        { sessionId: this.currentSessionId, prompt },
-        PROMPT_TIMEOUT_MS,
+      const res = (await this.requestPrompt(
+        this.currentSessionId,
+        prompt,
+        turn,
       )) as { stopReason?: string; usage?: unknown }
       const usage = extractAcpPromptUsage(res?.usage) ?? turn.usage
       if (usage) {
@@ -498,6 +512,77 @@ export class AcpRuntimeClient {
     }
   }
 
+  private requestPrompt(
+    sessionId: string,
+    prompt: readonly AcpPromptBlock[],
+    turn: ActiveTurnContext,
+  ): Promise<unknown> {
+    if (!this.transport || this.closed) {
+      return Promise.reject(new Error(`cannot send ${this.label} RPC "session/prompt": transport closed`))
+    }
+    const id = this.nextId++
+    const idleTimeoutMs = this.promptIdleTimeoutMs
+    let pendingPermissions = 0
+
+    return new Promise((resolve, reject) => {
+      const entry: PendingRequest = {
+        method: 'session/prompt',
+        resolve,
+        reject,
+      }
+
+      const clearIdleTimer = () => {
+        if (entry.timer) {
+          clearTimeout(entry.timer)
+          entry.timer = undefined
+        }
+      }
+
+      const armIdleTimer = () => {
+        clearIdleTimer()
+        if (idleTimeoutMs <= 0 || pendingPermissions > 0 || !this.pending.has(id)) return
+        entry.timer = setTimeout(() => {
+          if (!this.pending.delete(id)) return
+          entry.timer = undefined
+          const err = new Error(
+            `${this.label} RPC "session/prompt" idle timed out after ${idleTimeoutMs}ms without updates`,
+          )
+          turn.abortController.abort(err)
+          this.notify('session/cancel', { sessionId })
+          reject(err)
+        }, idleTimeoutMs)
+        entry.timer.unref?.()
+      }
+
+      turn.touchActivity = () => {
+        armIdleTimer()
+      }
+      turn.pauseIdleTimer = () => {
+        pendingPermissions += 1
+        clearIdleTimer()
+      }
+      turn.resumeIdleTimer = () => {
+        pendingPermissions = Math.max(0, pendingPermissions - 1)
+        armIdleTimer()
+      }
+
+      this.pending.set(id, entry)
+      armIdleTimer()
+      try {
+        this.transport!.send({
+          jsonrpc: '2.0',
+          id,
+          method: 'session/prompt',
+          params: { sessionId, prompt },
+        })
+      } catch (err) {
+        clearIdleTimer()
+        this.pending.delete(id)
+        reject(err instanceof Error ? err : new Error(String(err)))
+      }
+    })
+  }
+
   private request(method: string, params: unknown, timeoutMs = this.requestTimeoutMs): Promise<unknown> {
     if (!this.transport || this.closed) {
       return Promise.reject(new Error(`cannot send ${this.label} RPC "${method}": transport closed`))
@@ -541,7 +626,7 @@ export class AcpRuntimeClient {
       const pending = this.pending.get(msg.id)
       if (!pending) return
       this.pending.delete(msg.id)
-      clearTimeout(pending.timer)
+      if (pending.timer) clearTimeout(pending.timer)
       if (msg.error) {
         pending.reject(new AcpRpcError(pending.method, msg.error))
       } else {
@@ -574,6 +659,7 @@ export class AcpRuntimeClient {
     const turn = this.activeTurn
     const handler = turn?.handlers.onPermission
     if (!handler) {
+      turn?.touchActivity?.()
       const optionId = pickDefaultAllowOptionId(request.options)
       this.respond(
         id,
@@ -582,6 +668,7 @@ export class AcpRuntimeClient {
       return
     }
 
+    turn.pauseIdleTimer?.()
     try {
       const outcome = await handler(request, turn.abortController.signal)
       if (!this.closed) {
@@ -591,12 +678,15 @@ export class AcpRuntimeClient {
       if (!this.closed) {
         this.respond(id, { outcome: { outcome: 'cancelled' } })
       }
+    } finally {
+      turn.resumeIdleTimer?.()
     }
   }
 
   private handleSessionUpdate(params: unknown): void {
     const turn = this.activeTurn
     if (!turn) return
+    turn.touchActivity?.()
     const events = normalizeAcpSessionUpdate(params, turn.activeTools)
     for (const event of events) {
       if (event.type === 'text-delta') {
@@ -621,7 +711,7 @@ export class AcpRuntimeClient {
 
   private failPending(error: Error): void {
     for (const [id, pending] of this.pending) {
-      clearTimeout(pending.timer)
+      if (pending.timer) clearTimeout(pending.timer)
       this.pending.delete(id)
       pending.reject(error)
     }

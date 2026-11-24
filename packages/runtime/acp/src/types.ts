@@ -181,6 +181,11 @@ export interface AcpRuntimeOptions {
   /** Optional default ACP `_meta` object forwarded on `session/new`, `session/resume`, and `session/load`. */
   readonly sessionMeta?: Readonly<Record<string, unknown>>
   readonly requestTimeoutMs?: number
+  /**
+   * Idle timeout (ms) for an in-flight `session/prompt` turn when no `session/update`
+   * or permission activity arrives. Defaults to 30 minutes; set `0` to disable.
+   */
+  readonly promptIdleTimeoutMs?: number
   readonly clientName?: string
   readonly clientVersion?: string
   readonly logger?: (message: string) => void
