@@ -1188,3 +1188,165 @@ describe('AcpRuntimeClient model config options', () => {
     ])
   })
 })
+
+describe('AcpRuntimeClient prompt idle timeout', () => {
+  it('keeps an active turn alive past promptIdleTimeoutMs as long as session/update events keep arriving', async () => {
+    vi.useFakeTimers()
+    try {
+      let promptMsgId: number | string | undefined
+      const transport = new MockAcpTransport((msg, t) => {
+        if (msg.method === 'initialize') {
+          t.emit({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1 } })
+        } else if (msg.method === 'session/new') {
+          t.emit({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 'acp_long' } })
+        } else if (msg.method === 'session/prompt') {
+          promptMsgId = msg.id
+        }
+      })
+
+      const client = new AcpRuntimeClient({
+        cwd: '/repo',
+        command: 'agent',
+        args: [],
+        promptIdleTimeoutMs: 100,
+        transportFactory: () => transport,
+      })
+      await client.startOrResume()
+
+      const turnPromise = client.runTurn([{ type: 'text', text: 'long running task' }])
+
+      // Advance 240ms (> 2x promptIdleTimeoutMs) while emitting progress every 60ms.
+      for (let i = 1; i <= 4; i += 1) {
+        await vi.advanceTimersByTimeAsync(60)
+        transport.emit({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: 'acp_long',
+            update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `part-${i} ` } },
+          },
+        })
+      }
+
+      transport.emit({ jsonrpc: '2.0', id: promptMsgId, result: { stopReason: 'end_turn' } })
+      const res = await turnPromise
+      expect(res.stopReason).toBe('end_turn')
+      expect(res.text).toBe('part-1 part-2 part-3 part-4 ')
+      expect(transport.sent.some((m) => m.method === 'session/cancel')).toBe(false)
+      await client.close()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('rejects with idle timeout, sends session/cancel, and allows subsequent turns when stalled', async () => {
+    vi.useFakeTimers()
+    try {
+      let promptCount = 0
+      const transport = new MockAcpTransport((msg, t) => {
+        if (msg.method === 'initialize') {
+          t.emit({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1 } })
+        } else if (msg.method === 'session/new') {
+          t.emit({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 'acp_stall' } })
+        } else if (msg.method === 'session/prompt') {
+          promptCount += 1
+          if (promptCount === 2) {
+            t.emit({
+              jsonrpc: '2.0',
+              method: 'session/update',
+              params: {
+                sessionId: 'acp_stall',
+                update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'recovered' } },
+              },
+            })
+            t.emit({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn' } })
+          }
+        }
+      })
+
+      const client = new AcpRuntimeClient({
+        cwd: '/repo',
+        command: 'agent',
+        args: [],
+        promptIdleTimeoutMs: 100,
+        transportFactory: () => transport,
+      })
+      await client.startOrResume()
+
+      const turnPromise = client.runTurn([{ type: 'text', text: 'stalled task' }])
+      const expectation = expect(turnPromise).rejects.toThrow(/idle timed out after 100ms/)
+      await vi.advanceTimersByTimeAsync(110)
+      await expectation
+
+      expect(transport.sent).toContainEqual({
+        jsonrpc: '2.0',
+        method: 'session/cancel',
+        params: { sessionId: 'acp_stall' },
+      })
+
+      // Client must release activeTurn so a follow-up turn succeeds cleanly.
+      const nextRes = await client.runTurn([{ type: 'text', text: 'next task' }])
+      expect(nextRes.text).toBe('recovered')
+      await client.close()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('pauses idle timeout while waiting for interactive permission approval', async () => {
+    vi.useFakeTimers()
+    try {
+      let promptMsgId: number | string | undefined
+      let resolvePermission: ((outcome: { outcome: 'selected'; optionId: string }) => void) | undefined
+
+      const transport = new MockAcpTransport((msg, t) => {
+        if (msg.method === 'initialize') {
+          t.emit({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1 } })
+        } else if (msg.method === 'session/new') {
+          t.emit({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 'acp_perm' } })
+        } else if (msg.method === 'session/prompt') {
+          promptMsgId = msg.id
+          t.emit({
+            jsonrpc: '2.0',
+            id: 99,
+            method: 'session/request_permission',
+            params: {
+              sessionId: 'acp_perm',
+              toolCall: { toolCallId: 'tc_perm', name: 'bash', title: 'Run check' },
+              options: [{ optionId: 'allow_once', name: 'Allow', kind: 'allow_once' }],
+            },
+          })
+        } else if (msg.id === 99 && !msg.method) {
+          t.emit({ jsonrpc: '2.0', id: promptMsgId, result: { stopReason: 'end_turn' } })
+        }
+      })
+
+      const client = new AcpRuntimeClient({
+        cwd: '/repo',
+        command: 'agent',
+        args: [],
+        promptIdleTimeoutMs: 100,
+        transportFactory: () => transport,
+      })
+      await client.startOrResume()
+
+      const turnPromise = client.runTurn([{ type: 'text', text: 'needs approval' }], {
+        onPermission: () =>
+          new Promise((resolve) => {
+            resolvePermission = resolve
+          }),
+      })
+
+      // Wait 500ms (> 5x idle timeout) for human approval without triggering idle timeout.
+      await vi.advanceTimersByTimeAsync(500)
+      expect(transport.sent.some((m) => m.method === 'session/cancel')).toBe(false)
+
+      resolvePermission?.({ outcome: 'selected', optionId: 'allow_once' })
+      const res = await turnPromise
+      expect(res.stopReason).toBe('end_turn')
+      await client.close()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
