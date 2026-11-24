@@ -4,6 +4,7 @@ import {
   AcpRuntimeClient,
   normalizeAcpPermissionRequest,
   normalizeAcpSessionUpdate,
+  parseAcpCatalog,
   stripSshSessionEnv,
   type AcpActiveToolCall,
   type AcpJsonRpcMessage,
@@ -1086,5 +1087,104 @@ describe('AcpRuntimeClient model config options', () => {
     await expect(explicitClient.startOrResume()).rejects.toMatchObject({ code: -32000 })
     expect(explicitTransport.sent.map((m) => m.method)).toEqual(['initialize', 'authenticate', 'session/new'])
     await explicitClient.close()
+  })
+
+  it('forwards sessionMeta as _meta on session/new, session/resume, and session/load', async () => {
+    const sentMeta: Array<{ method: string; meta: unknown }> = []
+    const transport = new MockAcpTransport((msg, t) => {
+      if (msg.method === 'initialize') {
+        t.emit({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            protocolVersion: 1,
+            agentCapabilities: { loadSession: true, sessionCapabilities: { resume: {} } },
+          },
+        })
+      } else if (msg.method === 'session/resume') {
+        sentMeta.push({ method: msg.method, meta: (msg.params as Record<string, unknown>)?._meta })
+        t.emit({ jsonrpc: '2.0', id: msg.id, error: { code: -32002, message: 'Session not found' } })
+      } else if (msg.method === 'session/new') {
+        sentMeta.push({ method: msg.method, meta: (msg.params as Record<string, unknown>)?._meta })
+        t.emit({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 'acp_meta_1' } })
+      }
+    })
+
+    const sessionMeta = {
+      customAgent: { options: { settings: { env: { EXAMPLE_BASE_URL: 'http://127.0.0.1:9000' } } } },
+    }
+    const client = new AcpRuntimeClient({
+      cwd: '/repo',
+      command: 'agent',
+      args: [],
+      sessionMeta,
+      transportFactory: () => transport,
+    })
+
+    const sid = await client.startOrResume({ sessionId: 'stale_id' })
+    expect(sid).toBe('acp_meta_1')
+    expect(sentMeta).toEqual([
+      { method: 'session/resume', meta: sessionMeta },
+      { method: 'session/new', meta: sessionMeta },
+    ])
+    await client.close()
+  })
+
+  it('preserves configOptions thoughtLevels when legacy models.availableModels has no pre-multiplied suffixes', () => {
+    const snap = parseAcpCatalog({
+      models: {
+        currentModelId: 'default',
+        availableModels: [
+          { modelId: 'default', name: 'Default' },
+          { modelId: 'sonnet', name: 'Sonnet' },
+        ],
+      },
+      configOptions: [
+        {
+          id: 'model',
+          category: 'model',
+          type: 'select',
+          currentValue: 'default',
+          options: [
+            { value: 'default', name: 'Default' },
+            { value: 'sonnet', name: 'Sonnet' },
+          ],
+        },
+        {
+          id: 'effort',
+          category: 'thought_level',
+          type: 'select',
+          currentValue: 'medium',
+          options: [
+            { value: 'default', name: 'Default' },
+            { value: 'low', name: 'Low' },
+            { value: 'medium', name: 'Medium' },
+            { value: 'high', name: 'High' },
+          ],
+        },
+      ],
+    })
+    expect(snap.models).toEqual([
+      {
+        id: 'default',
+        name: 'Default',
+        thoughtLevels: [
+          { id: 'low', name: 'Low' },
+          { id: 'medium', name: 'Medium' },
+          { id: 'high', name: 'High' },
+        ],
+        defaultThoughtLevel: 'medium',
+      },
+      {
+        id: 'sonnet',
+        name: 'Sonnet',
+        thoughtLevels: [
+          { id: 'low', name: 'Low' },
+          { id: 'medium', name: 'Medium' },
+          { id: 'high', name: 'High' },
+        ],
+        defaultThoughtLevel: 'medium',
+      },
+    ])
   })
 })

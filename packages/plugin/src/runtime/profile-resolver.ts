@@ -1,4 +1,5 @@
 import { existsSync, readFileSync } from 'node:fs'
+import { homedir } from 'node:os'
 import { join } from 'node:path'
 import type { CatalogModelEntry } from '../catalog-adapter.js'
 import type {
@@ -30,6 +31,7 @@ export interface ResolvedRuntimeLaunchPlan extends ResolvedProfileDefaults {
   readonly args: readonly string[]
   readonly env: NodeJS.ProcessEnv
   readonly authMethodId?: string
+  readonly sessionMeta?: Readonly<Record<string, unknown>>
 }
 
 export function resolveProfileCapabilities(
@@ -68,7 +70,7 @@ export function resolveProfileCapabilities(
       supportsConfigFile: true,
       configFileHint: '~/.config/proxy/agy/settings.json',
       supportsEnv: true,
-      envHints: ['GOOGLE_GEMINI_BASE_URL', 'GEMINI_API_KEY'],
+      envHints: ['GOOGLE_GEMINI_BASE_URL', 'GEMINI_API_KEY', 'GOOGLE_CLOUD_PROJECT', 'GOOGLE_CLOUD_LOCATION'],
       supportsArgs: true,
       supportsAuthMethod: true,
       authMethods: liveAuthMethods && liveAuthMethods.length > 0 ? liveAuthMethods : AGY_DEFAULT_AUTH_METHODS,
@@ -78,7 +80,8 @@ export function resolveProfileCapabilities(
   if (spec.id === 'claude-code') {
     return {
       supportsCliProfile: false,
-      supportsConfigFile: false,
+      supportsConfigFile: true,
+      configFileHint: '~/.claude/custom.settings.json',
       supportsEnv: true,
       envHints: ['ANTHROPIC_BASE_URL', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CONFIG_DIR'],
       supportsArgs: true,
@@ -155,11 +158,19 @@ export function parseAgySettingsModel(
   return { model: trimmed.toLowerCase().replace(/\s+/g, '-') }
 }
 
-function readAgySettingsFile(filePath: string): {
+interface AgySettingsMeta {
   readonly modelProvider?: string
   readonly model?: string
   readonly effort?: string
-} {
+  readonly hasGcpConfig?: boolean
+}
+
+function defaultAgySettingsPath(env: NodeJS.ProcessEnv): string {
+  const userHome = env.HOME?.trim() || env.USERPROFILE?.trim() || homedir()
+  return join(userHome, '.gemini', 'antigravity-cli', 'settings.json')
+}
+
+function readAgySettingsFile(filePath: string): AgySettingsMeta {
   if (!existsSync(filePath)) return {}
   try {
     const parsed = JSON.parse(readFileSync(filePath, 'utf8')) as Record<string, unknown>
@@ -168,13 +179,166 @@ function readAgySettingsFile(filePath: string): {
         ? parsed.modelProvider.trim().toLowerCase()
         : undefined
     const modelParsed = typeof parsed.model === 'string' ? parseAgySettingsModel(parsed.model) : undefined
+    const gcp =
+      parsed.gcp && typeof parsed.gcp === 'object' && !Array.isArray(parsed.gcp)
+        ? (parsed.gcp as Record<string, unknown>)
+        : undefined
+    const hasGcpConfig = Boolean(
+      typeof gcp?.project === 'string' &&
+        gcp.project.trim() &&
+        typeof gcp?.location === 'string' &&
+        gcp.location.trim(),
+    )
     return {
       ...(modelProvider ? { modelProvider } : {}),
       ...(modelParsed?.model ? { model: modelParsed.model } : {}),
       ...(modelParsed?.effort ? { effort: modelParsed.effort } : {}),
+      ...(hasGcpConfig ? { hasGcpConfig: true } : {}),
     }
   } catch {
     return {}
+  }
+}
+
+function inferAgyAuthMethodId(
+  env: NodeJS.ProcessEnv,
+  settingsMeta?: AgySettingsMeta,
+  explicitAuthMethodId?: string,
+): string | undefined {
+  const explicit = explicitAuthMethodId?.trim()
+  if (explicit) return explicit
+  if (settingsMeta?.modelProvider === 'gemini') return 'gemini-api-key'
+  if (
+    settingsMeta?.modelProvider === 'vertex' ||
+    settingsMeta?.modelProvider === 'agent-platform' ||
+    settingsMeta?.hasGcpConfig
+  ) {
+    return 'agent-platform'
+  }
+  if (env.GEMINI_API_KEY?.trim()) return 'gemini-api-key'
+  if (env.GOOGLE_CLOUD_PROJECT?.trim() && env.GOOGLE_CLOUD_LOCATION?.trim()) {
+    return 'agent-platform'
+  }
+  return undefined
+}
+
+function readClaudeSettingsFile(
+  rawPath: string,
+  strict: boolean,
+): Record<string, unknown> | undefined {
+  const expanded = expandUserPath(rawPath)
+  if (!existsSync(expanded)) {
+    if (strict) {
+      throw new Error(`配置文件不存在：${rawPath}`)
+    }
+    return undefined
+  }
+  try {
+    const parsed = JSON.parse(readFileSync(expanded, 'utf8')) as unknown
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      if (strict) {
+        throw new Error(`配置文件格式无效（需为 JSON 对象）：${rawPath}`)
+      }
+      return undefined
+    }
+    return parsed as Record<string, unknown>
+  } catch (err) {
+    if (strict) throw err
+    return undefined
+  }
+}
+
+function normalizeClaudeSettingsEnv(
+  rawEnv: Readonly<Record<string, string>>,
+): Record<string, string> {
+  const out: Record<string, string> = { ...rawEnv }
+  const hasApiKey = Boolean(out.ANTHROPIC_API_KEY?.trim())
+  const hasAuthToken = Boolean(out.ANTHROPIC_AUTH_TOKEN?.trim())
+  const isTruthy = (val?: string): boolean => val === '1' || val?.toLowerCase() === 'true'
+  const useBedrock = isTruthy(out.CLAUDE_CODE_USE_BEDROCK)
+  const useVertex = isTruthy(out.CLAUDE_CODE_USE_VERTEX)
+  const hasBaseUrl = Boolean(out.ANTHROPIC_BASE_URL?.trim())
+
+  if (hasApiKey && !Object.prototype.hasOwnProperty.call(out, 'ANTHROPIC_AUTH_TOKEN')) {
+    out.ANTHROPIC_AUTH_TOKEN = ''
+  }
+  if (hasAuthToken && !Object.prototype.hasOwnProperty.call(out, 'ANTHROPIC_API_KEY')) {
+    out.ANTHROPIC_API_KEY = ''
+  }
+  if (hasBaseUrl && !useBedrock && !useVertex) {
+    if (!Object.prototype.hasOwnProperty.call(out, 'CLAUDE_CODE_USE_BEDROCK')) {
+      out.CLAUDE_CODE_USE_BEDROCK = '0'
+    }
+    if (!Object.prototype.hasOwnProperty.call(out, 'CLAUDE_CODE_USE_VERTEX')) {
+      out.CLAUDE_CODE_USE_VERTEX = '0'
+    }
+  } else if (useBedrock) {
+    if (!Object.prototype.hasOwnProperty.call(out, 'CLAUDE_CODE_USE_VERTEX')) {
+      out.CLAUDE_CODE_USE_VERTEX = '0'
+    }
+    if (!Object.prototype.hasOwnProperty.call(out, 'ANTHROPIC_BASE_URL')) out.ANTHROPIC_BASE_URL = ''
+    if (!Object.prototype.hasOwnProperty.call(out, 'ANTHROPIC_API_KEY')) out.ANTHROPIC_API_KEY = ''
+    if (!Object.prototype.hasOwnProperty.call(out, 'ANTHROPIC_AUTH_TOKEN')) out.ANTHROPIC_AUTH_TOKEN = ''
+  } else if (useVertex) {
+    if (!Object.prototype.hasOwnProperty.call(out, 'CLAUDE_CODE_USE_BEDROCK')) {
+      out.CLAUDE_CODE_USE_BEDROCK = '0'
+    }
+    if (!Object.prototype.hasOwnProperty.call(out, 'ANTHROPIC_BASE_URL')) out.ANTHROPIC_BASE_URL = ''
+    if (!Object.prototype.hasOwnProperty.call(out, 'ANTHROPIC_API_KEY')) out.ANTHROPIC_API_KEY = ''
+    if (!Object.prototype.hasOwnProperty.call(out, 'ANTHROPIC_AUTH_TOKEN')) out.ANTHROPIC_AUTH_TOKEN = ''
+  }
+  return out
+}
+
+function buildClaudeSessionSettings(
+  profile: ExternalRuntimeProfile,
+  strict: boolean,
+): {
+  readonly settings?: Record<string, unknown>
+  readonly defaults: ResolvedProfileDefaults
+} {
+  const fileSettings = profile.configFile ? readClaudeSettingsFile(profile.configFile, strict) : undefined
+  const profileEnv = expandProfileEnv(profile.env)
+  const runtimeEnvEntries = Object.entries(profileEnv).filter(([key]) => key !== 'CLAUDE_CONFIG_DIR')
+
+  if (!fileSettings && runtimeEnvEntries.length === 0) {
+    return { defaults: {} }
+  }
+
+  const baseSettings: Record<string, unknown> = fileSettings ? { ...fileSettings } : {}
+  const existingEnv: Record<string, string> = {}
+  if (baseSettings.env && typeof baseSettings.env === 'object' && !Array.isArray(baseSettings.env)) {
+    for (const [k, v] of Object.entries(baseSettings.env as Record<string, unknown>)) {
+      if (typeof v === 'string') existingEnv[k] = v
+    }
+  }
+  const combinedRawEnv: Record<string, string> = {
+    ...existingEnv,
+    ...Object.fromEntries(runtimeEnvEntries),
+  }
+  if (Object.keys(combinedRawEnv).length > 0) {
+    baseSettings.env = normalizeClaudeSettingsEnv(combinedRawEnv)
+  }
+
+  const envObj = baseSettings.env as Record<string, string> | undefined
+  const defaultModel =
+    (typeof baseSettings.model === 'string' && baseSettings.model.trim()
+      ? baseSettings.model.trim()
+      : undefined) ??
+    (typeof envObj?.ANTHROPIC_MODEL === 'string' && envObj.ANTHROPIC_MODEL.trim()
+      ? envObj.ANTHROPIC_MODEL.trim()
+      : undefined)
+  const defaultReasoningEffort =
+    typeof baseSettings.effortLevel === 'string' && baseSettings.effortLevel.trim()
+      ? baseSettings.effortLevel.trim()
+      : undefined
+
+  return {
+    settings: baseSettings,
+    defaults: {
+      ...(defaultModel ? { defaultModel } : {}),
+      ...(defaultReasoningEffort ? { defaultReasoningEffort } : {}),
+    },
   }
 }
 
@@ -279,6 +443,10 @@ export function resolveProfileDefaults(
       const settingsMeta = readAgySettingsFile(expandUserPath(profile.configFile))
       inferredModel = settingsMeta.model
       inferredEffort = settingsMeta.effort
+    } else if (spec.id === 'claude-code') {
+      const { defaults } = buildClaudeSessionSettings(profile, false)
+      inferredModel = defaults.defaultModel
+      inferredEffort = defaults.defaultReasoningEffort
     }
   }
 
@@ -372,10 +540,24 @@ function resolveCodexAppServerPlan(
 
   const isTrae = spec.id === 'trae'
   const explicitConfigPath = profile.configFile ? expandUserPath(profile.configFile) : undefined
+  const canonicalTraeProfilePath =
+    isTrae && profile.cliProfile
+      ? join(expandUserPath(env.TRAE_HOME || '~/.trae'), `${profile.cliProfile}.traecli.toml`)
+      : undefined
+  const useNativeTraeProfile = Boolean(
+    isTrae &&
+      profile.cliProfile &&
+      (!explicitConfigPath || explicitConfigPath === canonicalTraeProfilePath),
+  )
 
-  if (isTrae && profile.cliProfile && !explicitConfigPath && profile.argsMode !== 'replace') {
-    // TRAE CLI natively accepts `-p <profile>` before `app-server`.
-    args = ['-p', profile.cliProfile, ...args]
+  if (useNativeTraeProfile) {
+    // TRAE CLI natively accepts `-p <profile>` before `app-server` for `$TRAE_HOME/<name>.traecli.toml`.
+    if (profile.argsMode !== 'replace') {
+      if (!existsSync(canonicalTraeProfilePath!)) {
+        throw new Error(`未找到配置 "${profile.cliProfile}"（已检查 ${canonicalTraeProfilePath}）`)
+      }
+      args = ['-p', profile.cliProfile!, ...args]
+    }
     const parsed = readTomlModelDefaults(readCodexProfileToml(spec, profile, env, false))
     inferredModel = parsed.defaultModel
     inferredEffort = parsed.defaultReasoningEffort
@@ -414,10 +596,12 @@ function resolveAcpPlan(
   const command = resolveRuntimeCommand(spec, env)
   let args = [...spec.args]
   let authMethodId = profile.authMethodId?.trim() || undefined
+  let sessionMeta: Record<string, unknown> | undefined
   let inferredModel: string | undefined
   let inferredEffort: string | undefined
 
   if (spec.id === 'agy') {
+    let settingsMeta: AgySettingsMeta | undefined
     if (profile.configFile) {
       const expandedSettings = expandUserPath(profile.configFile)
       if (!existsSync(expandedSettings)) {
@@ -427,16 +611,22 @@ function resolveAcpPlan(
       if (profile.argsMode !== 'replace') {
         args = ['--settings', expandedSettings, ...args]
       }
-      const settingsMeta = readAgySettingsFile(expandedSettings)
-      if (!authMethodId && settingsMeta.modelProvider === 'gemini') {
-        authMethodId = 'gemini-api-key'
-      }
+      settingsMeta = readAgySettingsFile(expandedSettings)
       inferredModel = settingsMeta.model
       inferredEffort = settingsMeta.effort
+    } else {
+      settingsMeta = readAgySettingsFile(defaultAgySettingsPath(env))
     }
-    if (!authMethodId && profile.env?.GEMINI_API_KEY?.trim()) {
-      authMethodId = 'gemini-api-key'
+    authMethodId = inferAgyAuthMethodId(env, settingsMeta, authMethodId)
+  } else if (spec.id === 'claude-code') {
+    // Claude Code applies `~/.claude/settings.json`'s `env` after child process env, so
+    // forward profile `configFile` / `env` via programmatic ACP session settings to override it.
+    const { settings, defaults } = buildClaudeSessionSettings(profile, true)
+    if (settings) {
+      sessionMeta = { claudeCode: { options: { settings } } }
     }
+    inferredModel = defaults.defaultModel
+    inferredEffort = defaults.defaultReasoningEffort
   }
 
   args = mergeExtraArgs(args, profile.args, profile.argsMode ?? 'append')
@@ -448,6 +638,7 @@ function resolveAcpPlan(
     args,
     env,
     ...(authMethodId ? { authMethodId } : {}),
+    ...(sessionMeta ? { sessionMeta } : {}),
     ...(defaultModel ? { defaultModel } : {}),
     ...(defaultReasoningEffort ? { defaultReasoningEffort } : {}),
   }
@@ -466,10 +657,15 @@ export function resolveRuntimeLaunchPlan(
   const env = buildRuntimeEnv(spec, { ...profileEnv, ...(extraEnv ?? {}) })
 
   if (!profile) {
+    const authMethodId =
+      spec.id === 'agy'
+        ? inferAgyAuthMethodId(env, readAgySettingsFile(defaultAgySettingsPath(env)))
+        : undefined
     return {
       command: resolveRuntimeCommand(spec, env),
       args: spec.args,
       env,
+      ...(authMethodId ? { authMethodId } : {}),
       ...(spec.defaultModel ? { defaultModel: spec.defaultModel } : {}),
       ...(spec.defaultReasoningEffort ? { defaultReasoningEffort: spec.defaultReasoningEffort } : {}),
     }

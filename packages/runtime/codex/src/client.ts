@@ -24,6 +24,33 @@ import type {
 const DEFAULT_REQUEST_TIMEOUT_MS = 60_000
 const DEFAULT_APP_SERVER_ARGS: readonly string[] = ['app-server', '--stdio']
 const MAX_MODEL_LIST_PAGES = 20
+const CODEX_RESOURCE_NOT_FOUND_CODE = -32002
+const THREAD_NOT_FOUND_RE =
+  /no rollout found|thread\s+\S*\s*not found|session\s+\S*\s*not found|unknown thread/i
+
+/** Error returned by a Codex/TRAE app-server JSON-RPC response, preserving its error code and data. */
+export class CodexRpcError extends Error {
+  readonly method: string
+  readonly code?: number
+  readonly data?: unknown
+
+  constructor(method: string, error: { readonly code?: number; readonly message?: string; readonly data?: unknown }) {
+    super(error.message || JSON.stringify(error))
+    this.name = 'CodexRpcError'
+    this.method = method
+    this.code = error.code
+    this.data = error.data
+  }
+}
+
+/** True when `thread/resume` failed because the stored thread/rollout no longer exists. */
+export function isThreadNotFoundError(err: unknown): boolean {
+  if (err instanceof CodexRpcError && err.code === CODEX_RESOURCE_NOT_FOUND_CODE) {
+    return true
+  }
+  const message = err instanceof Error ? err.message : typeof err === 'string' ? err : ''
+  return THREAD_NOT_FOUND_RE.test(message)
+}
 
 interface PendingRequest {
   readonly method: string
@@ -157,6 +184,7 @@ export class CodexRuntimeClient {
   private initialized = false
   private closed = false
   private currentThreadId?: string
+  private pendingTurnSelection?: { readonly model?: string; readonly reasoningEffort?: string }
   private activeTurn?: ActiveTurnState
   private readonly pending = new Map<number, PendingRequest>()
 
@@ -206,6 +234,7 @@ export class CodexRuntimeClient {
     await this.initialize()
     const approvalPolicy = options.approvalPolicy ?? 'never'
     const sandbox = options.sandbox ?? 'workspace-write'
+    this.pendingTurnSelection = undefined
 
     if (options.threadId) {
       const params: Record<string, unknown> = {
@@ -222,9 +251,42 @@ export class CodexRuntimeClient {
         if (options.reasoningEffort) config.model_reasoning_effort = options.reasoningEffort
         if (Object.keys(config).length > 0) params.config = config
       }
-      const res = (await this.request('thread/resume', params)) as { thread?: { id?: string } }
-      this.currentThreadId = res?.thread?.id || options.threadId
-      return this.currentThreadId
+      try {
+        const res = (await this.request('thread/resume', params)) as {
+          thread?: { id?: string; model?: string }
+          model?: string
+          reasoningEffort?: string
+        }
+        this.currentThreadId = res?.thread?.id || options.threadId
+        if (!options.forceModelOverride) {
+          const resumedModel =
+            typeof res?.model === 'string' && res.model
+              ? res.model
+              : typeof res?.thread?.model === 'string' && res.thread.model
+                ? res.thread.model
+                : undefined
+          const resumedEffort =
+            typeof res?.reasoningEffort === 'string' && res.reasoningEffort
+              ? res.reasoningEffort
+              : undefined
+          const modelDiffers = Boolean(options.model && resumedModel && options.model !== resumedModel)
+          const effortDiffers = Boolean(
+            options.reasoningEffort && resumedEffort && options.reasoningEffort !== resumedEffort,
+          )
+          if (modelDiffers || effortDiffers) {
+            this.pendingTurnSelection = {
+              ...(options.model ? { model: options.model } : {}),
+              ...(options.reasoningEffort ? { reasoningEffort: options.reasoningEffort } : {}),
+            }
+          }
+        }
+        return this.currentThreadId
+      } catch (err) {
+        if (!isThreadNotFoundError(err)) throw err
+        this.logger(
+          `${this.label} thread ${options.threadId} not found; starting a new thread`,
+        )
+      }
     }
 
     const config: Record<string, unknown> = {}
@@ -331,12 +393,16 @@ export class CodexRuntimeClient {
       }
 
       const sandboxPolicy = sandboxPolicyForTurn(input.sandbox)
+      const pendingSelection = this.pendingTurnSelection
+      this.pendingTurnSelection = undefined
+      const effectiveModel = input.model ?? pendingSelection?.model
+      const effectiveEffort = input.reasoningEffort ?? pendingSelection?.reasoningEffort
       const params: Record<string, unknown> = {
         threadId: this.currentThreadId,
         input: inputBlocks,
         cwd: this.cwd,
-        ...(input.model ? { model: input.model } : {}),
-        ...(input.reasoningEffort ? { effort: input.reasoningEffort } : {}),
+        ...(effectiveModel ? { model: effectiveModel } : {}),
+        ...(effectiveEffort ? { effort: effectiveEffort } : {}),
         ...(input.approvalPolicy ? { approvalPolicy: input.approvalPolicy } : {}),
         ...(sandboxPolicy ? { sandboxPolicy } : {}),
       }
@@ -372,6 +438,7 @@ export class CodexRuntimeClient {
     const transport = this.transport
     this.transport = undefined
     this.initialized = false
+    this.pendingTurnSelection = undefined
     this.failInflight(new Error(`${this.label} runtime closed`))
     if (transport) {
       await transport.close()
@@ -428,7 +495,7 @@ export class CodexRuntimeClient {
       this.pending.delete(msg.id)
       clearTimeout(pending.timer)
       if (msg.error) {
-        pending.reject(new Error(msg.error.message || JSON.stringify(msg.error)))
+        pending.reject(new CodexRpcError(pending.method, msg.error))
       } else {
         pending.resolve(msg.result)
       }
@@ -593,6 +660,7 @@ export class CodexRuntimeClient {
   private handleTransportClosed(error?: Error): void {
     this.initialized = false
     this.transport = undefined
+    this.pendingTurnSelection = undefined
     this.failInflight(error ?? new Error('codex app-server transport closed'))
   }
 

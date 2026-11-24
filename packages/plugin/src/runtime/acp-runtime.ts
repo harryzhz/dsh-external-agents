@@ -81,13 +81,14 @@ function launchOptions(
   spec: ExternalRuntimeSpec,
   profile?: ExternalRuntimeProfile,
   extraEnv?: Readonly<Record<string, string>>,
-): Pick<AcpRuntimeOptions, 'command' | 'args' | 'env' | 'authMethodId'> {
+): Pick<AcpRuntimeOptions, 'command' | 'args' | 'env' | 'authMethodId' | 'sessionMeta'> {
   const plan = resolveRuntimeLaunchPlan(spec, profile, extraEnv)
   return {
     command: plan.command,
     args: plan.args,
     env: plan.env,
     ...(plan.authMethodId ? { authMethodId: plan.authMethodId } : {}),
+    ...(plan.sessionMeta ? { sessionMeta: plan.sessionMeta } : {}),
   }
 }
 
@@ -177,6 +178,7 @@ export function createAcpRuntime(spec: ExternalRuntimeSpec): ExternalRuntimeDefi
         args: plan.args,
         env: plan.env,
         ...(plan.authMethodId ? { authMethodId: plan.authMethodId } : {}),
+        ...(plan.sessionMeta ? { sessionMeta: plan.sessionMeta } : {}),
       })
       if (snapshot.authMethods && snapshot.authMethods.length > 0) {
         cachedAuthMethods = snapshot.authMethods

@@ -157,6 +157,8 @@ export interface AcpStartOptions {
   readonly thoughtLevel?: string
   readonly modeId?: string
   readonly authMethodId?: string
+  /** Optional ACP `_meta` object forwarded on `session/new`, `session/resume`, and `session/load`. */
+  readonly sessionMeta?: Readonly<Record<string, unknown>>
 }
 
 export interface AcpTransportFactoryOptions {
@@ -176,6 +178,8 @@ export interface AcpRuntimeOptions {
   readonly env?: NodeJS.ProcessEnv
   /** Optional ACP authentication method id to invoke right after `initialize` (e.g. `gemini-api-key`). */
   readonly authMethodId?: string
+  /** Optional default ACP `_meta` object forwarded on `session/new`, `session/resume`, and `session/load`. */
+  readonly sessionMeta?: Readonly<Record<string, unknown>>
   readonly requestTimeoutMs?: number
   readonly clientName?: string
   readonly clientVersion?: string

@@ -56,6 +56,7 @@ export class AcpRuntimeClient {
   private readonly args: readonly string[]
   private readonly env: NodeJS.ProcessEnv
   private readonly defaultAuthMethodId?: string
+  private readonly defaultSessionMeta?: Readonly<Record<string, unknown>>
   private readonly label: string
   private readonly requestTimeoutMs: number
   private readonly clientName: string
@@ -79,6 +80,10 @@ export class AcpRuntimeClient {
     this.args = options.args
     this.env = options.env ?? process.env
     this.defaultAuthMethodId = options.authMethodId?.trim() || undefined
+    this.defaultSessionMeta =
+      options.sessionMeta && Object.keys(options.sessionMeta).length > 0
+        ? options.sessionMeta
+        : undefined
     this.label = `acp(${options.command})`
     this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS
     this.clientName = options.clientName ?? 'dsh-external-agents'
@@ -157,10 +162,14 @@ export class AcpRuntimeClient {
     if (targetAuthMethod && this.authenticatedMethodId !== targetAuthMethod) {
       await this.authenticate(targetAuthMethod)
     }
+    const sessionMeta =
+      options.sessionMeta && Object.keys(options.sessionMeta).length > 0
+        ? options.sessionMeta
+        : this.defaultSessionMeta
     const open = (): Promise<OpenedSession> =>
       options.sessionId
-        ? this.restoreSession(options.sessionId, init.agentCapabilities)
-        : this.newSession()
+        ? this.restoreSession(options.sessionId, init.agentCapabilities, sessionMeta)
+        : this.newSession(sessionMeta)
 
     let opened: OpenedSession
     try {
@@ -344,10 +353,13 @@ export class AcpRuntimeClient {
     }
   }
 
-  private async newSession(): Promise<OpenedSession> {
+  private async newSession(
+    sessionMeta?: Readonly<Record<string, unknown>>,
+  ): Promise<OpenedSession> {
     const res = (await this.request('session/new', {
       cwd: this.cwd,
       mcpServers: [],
+      ...(sessionMeta ? { _meta: sessionMeta } : {}),
     })) as { sessionId?: unknown } | undefined
     if (typeof res?.sessionId !== 'string' || res.sessionId.length === 0) {
       throw new Error(`${this.label} session/new returned no sessionId`)
@@ -358,8 +370,14 @@ export class AcpRuntimeClient {
   private async restoreSession(
     sessionId: string,
     capabilities: AcpAgentCapabilities,
+    sessionMeta?: Readonly<Record<string, unknown>>,
   ): Promise<OpenedSession> {
-    const params = { sessionId, cwd: this.cwd, mcpServers: [] }
+    const params = {
+      sessionId,
+      cwd: this.cwd,
+      mcpServers: [],
+      ...(sessionMeta ? { _meta: sessionMeta } : {}),
+    }
     try {
       if (capabilities.resume !== 'unsupported') {
         try {
@@ -380,7 +398,7 @@ export class AcpRuntimeClient {
       if (!isResourceNotFound(err)) throw err
       this.logger(`${this.label} session ${sessionId} not found; starting a new session`)
     }
-    return await this.newSession()
+    return await this.newSession(sessionMeta)
   }
 
   private normalizeModelAndThought(

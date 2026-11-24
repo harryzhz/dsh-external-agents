@@ -156,6 +156,112 @@ describe('CodexRuntimeClient', () => {
     await client.close()
   })
 
+  it('recovers from missing rollout/thread on thread/resume by starting a fresh thread, while rethrowing auth/config errors', async () => {
+    const logs: string[] = []
+    const transport = new MockTransport((msg, t) => {
+      if (msg.method === 'initialize') {
+        t.emit({ jsonrpc: '2.0', id: msg.id, result: {} })
+      } else if (msg.method === 'thread/resume') {
+        t.emit({
+          jsonrpc: '2.0',
+          id: msg.id,
+          error: { code: -32600, message: 'no rollout found for thread id thr_stale' },
+        })
+      } else if (msg.method === 'thread/start') {
+        t.emit({ jsonrpc: '2.0', id: msg.id, result: { thread: { id: 'thr_fresh' } } })
+      }
+    })
+
+    const client = new CodexRuntimeClient({
+      cwd: '/tmp',
+      logger: (m) => logs.push(m),
+      transportFactory: () => transport,
+    })
+    const threadId = await client.startOrResume({
+      threadId: 'thr_stale',
+      model: 'gpt-6.1-sol',
+      reasoningEffort: 'high',
+    })
+    expect(threadId).toBe('thr_fresh')
+    expect(transport.sent.map((m) => m.method)).toEqual([
+      'initialize',
+      'initialized',
+      'thread/resume',
+      'thread/start',
+    ])
+    expect(logs.some((m) => m.includes('thr_stale'))).toBe(true)
+    await client.close()
+
+    const authErrorTransport = new MockTransport((msg, t) => {
+      if (msg.method === 'initialize') t.emit({ jsonrpc: '2.0', id: msg.id, result: {} })
+      else if (msg.method === 'thread/resume') {
+        t.emit({
+          jsonrpc: '2.0',
+          id: msg.id,
+          error: { code: -32000, message: 'No auth token available' },
+        })
+      }
+    })
+    const authClient = new CodexRuntimeClient({ cwd: '/tmp', transportFactory: () => authErrorTransport })
+    await expect(authClient.startOrResume({ threadId: 'thr_existing' })).rejects.toThrow(
+      'No auth token available',
+    )
+    expect(authErrorTransport.sent.map((m) => m.method)).toEqual([
+      'initialize',
+      'initialized',
+      'thread/resume',
+    ])
+    await authClient.close()
+  })
+
+  it('applies changed model/effort on the first turn/start after cold thread/resume without mutating thread/resume config', async () => {
+    const turnParams: Array<Record<string, unknown>> = []
+    let turnSeq = 0
+    const transport = new MockTransport((msg, t) => {
+      if (msg.method === 'initialize') {
+        t.emit({ jsonrpc: '2.0', id: msg.id, result: {} })
+      } else if (msg.method === 'thread/resume') {
+        t.emit({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            thread: { id: 'thr_existing', model: 'gpt-6.1-sol' },
+            model: 'gpt-6.1-sol',
+            modelProvider: 'custom_proxy',
+            reasoningEffort: 'low',
+          },
+        })
+      } else if (msg.method === 'turn/start') {
+        turnSeq += 1
+        turnParams.push(msg.params as Record<string, unknown>)
+        const turnId = `turn_${turnSeq}`
+        t.emit({ jsonrpc: '2.0', id: msg.id, result: { turn: { id: turnId } } })
+        queueMicrotask(() => {
+          t.emit({ jsonrpc: '2.0', method: 'item/agentMessage/delta', params: { delta: 'ok' } })
+          t.emit({ jsonrpc: '2.0', method: 'turn/completed', params: { turn: { id: turnId, status: 'completed' } } })
+        })
+      }
+    })
+
+    const client = new CodexRuntimeClient({ cwd: '/tmp', transportFactory: () => transport })
+    await client.startOrResume({
+      threadId: 'thr_existing',
+      model: 'gpt-6.2-sol',
+      reasoningEffort: 'high',
+    })
+    const resumeReq = transport.sent.find((m) => m.method === 'thread/resume')
+    expect((resumeReq?.params as Record<string, unknown>).config).toBeUndefined()
+
+    await client.runTurn({ text: 'turn 1 after cold resume' })
+    expect(turnParams[0]).toMatchObject({ model: 'gpt-6.2-sol', effort: 'high' })
+
+    // Consumed once; next turn without model change omits redundant overrides.
+    await client.runTurn({ text: 'turn 2 same model' })
+    expect(turnParams[1]?.model).toBeUndefined()
+    expect(turnParams[1]?.effort).toBeUndefined()
+    await client.close()
+  })
+
   it('bridges approvals, user input, and interrupts turn when user input fails', async () => {
     const serverResponses: JsonRpcMessage[] = []
     let interruptCalled = false
