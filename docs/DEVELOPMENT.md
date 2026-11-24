@@ -30,19 +30,31 @@
    ```bash
    git push -u origin feat/<slug>
    ```
-4. **向 `main` 发起 Pull Request**：
+4. **向 `main` 发起 Pull Request 并执行端到端真实验证**：
    - 使用 `gh pr create --base main` 或在 GitHub 页面创建 PR，简要说明变更动机、核心改动与本地验证结果。
-   - 确保 CI（`check:privacy`、`build`、`typecheck`、`test`、`pack`）全部通过后再合并到 `main`。
-5. **合入后同步主干并清理 Worktree**：
+   - 确保 CI（`check:privacy`、`build`、`typecheck`、`test`、`pack`）全部通过，并按第 2 节完成真实环境端到端验证（纯文档变更除外）。
+5. **验证通过后自动合入 `main`、同步构建、清理 Worktree 并优雅重启服务**：
+   - 当门禁、GitHub CI 与端到端真实验证全部通过后，无需等待二次确认，直接自动合入 `main` 并清理工作树：
    ```bash
+   gh pr merge <pr-number> --squash --delete-branch
    cd <主仓库根目录>
    git fetch origin && git checkout main && git pull --ff-only origin main
+   pnpm build
    git worktree remove .worktrees/<slug>
-   git branch -d feat/<slug>
+   git branch -d feat/<slug> 2>/dev/null || true
    git worktree prune
    ```
+   - 涉及运行时代码变更时，将主干构建产物同步至本地 DSH 运行环境并执行优雅排空重启与健康自检（纯文档变更无需重启）。
 
-## 2. 常用命令与目录约定
+## 2. 端到端真实验证与自动合入重启
+
+除纯文档变更外，本地交付前须完成真实环境端到端验证，通过后自动完成合入与重启闭环：
+
+- **飞书端到端实测**：当任务由飞书端发起时，默认在当前触发任务所在的飞书群/话题实测；若用户显式提供了验收群，则在提供的验收群实测。**严禁将任何真实群名称、群 ID 或消息 ID 写入文档、代码、测试夹具或 PR 描述**；非飞书发起且未指定验收群时，先向用户确认，严禁向非测试业务群发送测试消息。
+- **真实浏览器验证**：使用真实浏览器（如无头 Chrome / CDP / Playwright）访问本地 DSH Web，核验外部运行时预设展示、会话交互/轨迹渲染正常，且无 `pageerror`、`console.error` 或接口 4xx/5xx 报错。
+- **优雅排空重启**：合入 `main` 并重新执行 `pnpm build`（若本地 profile 以 `file:` 挂载，同步更新对应运行期 `dist/`）后，先执行 `lark-bridge lifecycle drain --wait --reason "<reason>"`（飞书会话内发起时通过 `.local/` 下的脱离进程组脚本在当前回复送达后使用 `--allow-in-session` 执行，避免中断当前回合），排空后重启本地 DSH 托管服务并运行 `lark-bridge doctor` 验证。任一验证或排空异常均须立即中止自动合入或重启并回报失败原因。
+
+## 3. 常用命令与目录约定
 
 | 命令 | 说明 |
 | --- | --- |
@@ -56,7 +68,7 @@
 
 - **本地研发产物**：临时脚本、测试日志、本地打包 `.tgz` 统一放入 `.local/`（已 gitignore），不得污染仓库根目录或提交进 Git。
 
-## 3. 开源隐私与提交自检清单
+## 4. 开源隐私与提交自检清单
 
 本仓库面向 GitHub 公开发布，完整安全边界见 [SECURITY.md](../SECURITY.md)。提交代码、测试、文档或依赖变更前逐项确认：
 

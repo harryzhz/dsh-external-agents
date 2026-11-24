@@ -4,12 +4,13 @@
 
 ## 开发工作流（默认规则）
 
-- **Worktree + 分支 + PR**：新需求或修复默认基于最新 `origin/main` 在 `.worktrees/<slug>` 新建独立 worktree 与功能分支（如 `feat/<slug>`、`fix/<slug>`、`docs/<slug>`）开发，**禁止直接在 `main` 分支提交**（除非用户明确要求）。完成后推送分支并向 `main` 发起 GitHub PR，合入后清理 worktree 与已合并分支（详见 [docs/DEVELOPMENT.md](./docs/DEVELOPMENT.md)）。
+- **Worktree + 分支 + PR**：新需求或修复默认基于最新 `origin/main` 在 `.worktrees/<slug>` 新建独立 worktree 与功能分支（如 `feat/<slug>`、`fix/<slug>`、`docs/<slug>`）开发，**禁止直接在 `main` 分支提交**（除非用户明确要求）。完成后推送分支并向 `main` 发起 GitHub PR，验证与 CI 通过后自动合入 `main`、清理 worktree 与已合并分支并按需优雅重启服务（详见 [docs/DEVELOPMENT.md](./docs/DEVELOPMENT.md)）。
 - **临时产物目录**：本地研发脚本、调试日志与打包 `.tgz` 统一输出至 `.local/`（已 gitignore），严禁污染仓库根目录。
 - **合并前门禁**：提交与发起 PR 前必须全部通过：
   ```bash
   pnpm build && pnpm typecheck && pnpm test && pnpm run check:privacy
   ```
+- **端到端真实验证与自动合入重启**：除纯文档修改外，若任务由飞书端发起或用户显式提供了验收群，须在所在群或验收群完成端到端实测（**严禁将任何真实群名称或群 ID 写入文档、代码、测试或 PR**），并在真实浏览器验证本地 DSH Web；全部验证与 CI 通过后自动将 PR 合入 `main`、同步构建并优雅重启本地 DSH 服务（详见 [docs/DEVELOPMENT.md](./docs/DEVELOPMENT.md#2-端到端真实验证与自动合入重启)）。
 
 ## 核心红线（每次必守）
 
