@@ -25,20 +25,26 @@ import {
   type ExternalRuntimeSpec,
 } from './config.js'
 import { toRuntimeSummary, type ExternalRuntimeDefinition } from './definition.js'
-import { extractTextFromMessages, readImageSource } from './message-content.js'
+import { extractTextFromMessages, resolveImageSource } from './message-content.js'
 import {
   resolveProfileCapabilities,
   resolveProfileDefaults,
   resolveRuntimeLaunchPlan,
 } from './profile-resolver.js'
 
-function extractCodexImages(messages: readonly UserMessage[]): Array<{ url: string }> {
-  const images: Array<{ url: string }> = []
+async function extractCodexImages(
+  ctx: Context,
+  messages: readonly UserMessage[],
+  signal: AbortSignal,
+): Promise<Array<{ readonly url?: string; readonly path?: string }>> {
+  const images: Array<{ readonly url?: string; readonly path?: string }> = []
   for (const message of messages) {
     for (const block of message.content) {
       if (block.type !== 'image') continue
-      const source = readImageSource(block)
-      if (source.url) {
+      const source = await resolveImageSource(ctx, block, { signal, preferHostPath: true })
+      if (source.path) {
+        images.push({ path: source.path })
+      } else if (source.url) {
         images.push({ url: source.url })
       } else if (source.data) {
         images.push({ url: `data:${source.mimeType};base64,${source.data}` })
@@ -152,7 +158,7 @@ class CodexDriverAdapter implements ExternalRuntimeDriver {
     signal: AbortSignal,
   ): Promise<ExternalTurnRunResult> {
     const text = extractTextFromMessages(request.messages)
-    const images = extractCodexImages(request.messages)
+    const images = await extractCodexImages(this.ctx, request.messages, signal)
     const res = await this.client.runTurn(
       {
         text,
