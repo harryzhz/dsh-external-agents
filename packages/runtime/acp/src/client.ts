@@ -1,4 +1,4 @@
-import { AcpRpcError, isMethodNotFound, isResourceNotFound } from './errors.js'
+import { AcpRpcError, isAuthRequired, isMethodNotFound, isResourceNotFound } from './errors.js'
 import {
   extractAcpPromptUsage,
   normalizeAcpPermissionRequest,
@@ -157,9 +157,26 @@ export class AcpRuntimeClient {
     if (targetAuthMethod && this.authenticatedMethodId !== targetAuthMethod) {
       await this.authenticate(targetAuthMethod)
     }
-    const opened = options.sessionId
-      ? await this.restoreSession(options.sessionId, init.agentCapabilities)
-      : await this.newSession()
+    const open = (): Promise<OpenedSession> =>
+      options.sessionId
+        ? this.restoreSession(options.sessionId, init.agentCapabilities)
+        : this.newSession()
+
+    let opened: OpenedSession
+    try {
+      opened = await open()
+    } catch (err) {
+      const fallbackAuthMethod =
+        !targetAuthMethod && !this.authenticatedMethodId && isAuthRequired(err)
+          ? init.authMethods[0]?.id
+          : undefined
+      if (!fallbackAuthMethod) throw err
+      this.logger(
+        `${this.label} session open requires authentication; retrying with default authMethod "${fallbackAuthMethod}"`,
+      )
+      await this.authenticate(fallbackAuthMethod)
+      opened = await open()
+    }
     this.currentSessionId = opened.sessionId
     const parsedCatalog = parseAcpCatalog(opened.result)
     this.catalogSnapshot =

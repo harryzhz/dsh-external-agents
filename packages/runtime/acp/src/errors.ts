@@ -22,6 +22,17 @@ export function isMethodNotFound(error: unknown): boolean {
   return error instanceof AcpRpcError && error.code === JSON_RPC_METHOD_NOT_FOUND
 }
 
+/** ACP "authentication required" error returned before `authenticate` succeeds. */
+export const ACP_AUTH_REQUIRED = -32000
+
+export function isAuthRequired(error: unknown): boolean {
+  return (
+    error instanceof AcpRpcError &&
+    error.code === ACP_AUTH_REQUIRED &&
+    (!error.message || /auth/i.test(error.message))
+  )
+}
+
 /** ACP "resource not found", e.g. resuming a session the agent never persisted. */
 export const ACP_RESOURCE_NOT_FOUND = -32002
 
