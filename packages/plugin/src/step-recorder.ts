@@ -11,6 +11,7 @@ import {
   type ToolCallId,
 } from '@deepseek-ai/dsh-llm'
 import type { Session } from '@deepseek-ai/dsh-session'
+import { MarkdownFileLinkNormalizer } from './markdown-file-links.js'
 import type { ExternalTurnEvent } from './types.js'
 
 export interface StreamEmitter {
@@ -23,7 +24,12 @@ interface ActiveAttempt {
   readonly assembler: BlockAssembler
   chunkIndex: number
   nextBlockIndex: number
-  openBlock?: { readonly index: number; readonly kind: 'text' | 'reasoning'; buffer: string }
+  openBlock?: {
+    readonly index: number
+    readonly kind: 'text' | 'reasoning'
+    buffer: string
+    readonly normalizer: MarkdownFileLinkNormalizer
+  }
 }
 
 interface PendingTool {
@@ -173,10 +179,28 @@ export class ExternalStepRecorder {
     })
   }
 
+  private emitNormalizedTextChunk(
+    attempt: ActiveAttempt,
+    open: NonNullable<ActiveAttempt['openBlock']>,
+    normalized: string,
+  ): void {
+    if (!normalized) return
+    open.buffer += normalized
+    if (open.kind === 'text') {
+      this.pushChunk(attempt, { type: 'text-delta', index: open.index, text: normalized })
+    } else {
+      this.pushChunk(attempt, { type: 'reasoning-delta', index: open.index, text: normalized })
+    }
+  }
+
   private closeOpenTextualBlock(attempt: ActiveAttempt): void {
     const open = attempt.openBlock
     if (!open) return
     attempt.openBlock = undefined
+    const tail = open.normalizer.flush()
+    if (tail) {
+      this.emitNormalizedTextChunk(attempt, open, tail)
+    }
     if (open.kind === 'text') {
       this.pushChunk(attempt, {
         type: 'block-end',
@@ -200,15 +224,11 @@ export class ExternalStepRecorder {
     }
     if (!attempt.openBlock) {
       const index = attempt.nextBlockIndex++
-      attempt.openBlock = { index, kind, buffer: '' }
+      attempt.openBlock = { index, kind, buffer: '', normalizer: new MarkdownFileLinkNormalizer() }
       this.pushChunk(attempt, { type: 'block-start', index, blockType: kind })
     }
-    attempt.openBlock.buffer += text
-    if (kind === 'text') {
-      this.pushChunk(attempt, { type: 'text-delta', index: attempt.openBlock.index, text })
-    } else {
-      this.pushChunk(attempt, { type: 'reasoning-delta', index: attempt.openBlock.index, text })
-    }
+    const normalized = attempt.openBlock.normalizer.push(text)
+    this.emitNormalizedTextChunk(attempt, attempt.openBlock, normalized)
   }
 
   private handleToolStart(rawCallId: string, name: string, args: string): void {

@@ -168,4 +168,88 @@ describe('ExternalStepRecorder', () => {
       { type: 'text', text: '最终答复。' },
     ])
   })
+
+  it('normalizes local file:// markdown links across streaming chunks so stream deltas match persisted blocks', () => {
+    const { session, events } = createFakeSession()
+    const streamedText: string[] = []
+    const streamedReasoning: string[] = []
+    let attemptSeq = 0
+    let rev = 0
+
+    const recorder = new ExternalStepRecorder({
+      agentId: 'a4',
+      session,
+      emitter: {
+        emitStream: (ev) => {
+          if (ev.type !== 'chunk') return
+          if (ev.chunk.type === 'text-delta') streamedText.push(ev.chunk.text)
+          if (ev.chunk.type === 'reasoning-delta') streamedReasoning.push(ev.chunk.text)
+        },
+      },
+      turn: 1,
+      provider: 'agy-cli',
+      model: 'gemini-4-neon',
+      nextAttemptId: () => brandString<LlmAttemptId>(`att_${++attemptSeq}`),
+      nextFrameRevision: () => ++rev,
+    })
+
+    recorder.startInitialStep()
+    for (const piece of ['Check [plan.md](fi', 'le:///Users/demo/plan.md#L3)']) {
+      recorder.handleEvent({ type: 'reasoning-delta', text: piece })
+    }
+    const rawReply =
+      'Updated [MemoryView.tsx](file:///Users/demo/repo/MemoryView.tsx#L10-L20) and kept `[raw](file:///Users/demo/raw.ts)`.'
+    for (let i = 0; i < rawReply.length; i += 4) {
+      recorder.handleEvent({ type: 'text-delta', text: rawReply.slice(i, i + 4) })
+    }
+    recorder.finish(false)
+
+    const expectedReasoning = 'Check [plan.md](/Users/demo/plan.md#L3)'
+    const expectedText =
+      'Updated [MemoryView.tsx](/Users/demo/repo/MemoryView.tsx#L10-L20) and kept `[raw](file:///Users/demo/raw.ts)`.'
+
+    expect(streamedReasoning.join('')).toBe(expectedReasoning)
+    expect(streamedText.join('')).toBe(expectedText)
+
+    const assistantEvent = events.find((e) => e.type === 'assistant/message')!
+    const msg = assistantEvent.data.message as { content: Array<{ type: string; text: string }> }
+    expect(msg.content).toEqual([
+      { type: 'reasoning', text: expectedReasoning },
+      { type: 'text', text: expectedText },
+    ])
+  })
+
+  it('flushes buffered incomplete link tail cleanly when aborted mid-stream', () => {
+    const { session, events } = createFakeSession()
+    const streamedText: string[] = []
+    let attemptSeq = 0
+    let rev = 0
+
+    const recorder = new ExternalStepRecorder({
+      agentId: 'a5',
+      session,
+      emitter: {
+        emitStream: (ev) => {
+          if (ev.type === 'chunk' && ev.chunk.type === 'text-delta') {
+            streamedText.push(ev.chunk.text)
+          }
+        },
+      },
+      turn: 1,
+      provider: 'agy-cli',
+      model: 'gemini-4-neon',
+      nextAttemptId: () => brandString<LlmAttemptId>(`att_${++attemptSeq}`),
+      nextFrameRevision: () => ++rev,
+    })
+
+    recorder.startInitialStep()
+    recorder.handleEvent({ type: 'text-delta', text: 'Inspect [MemoryView.tsx](file:///Users/demo/Mem' })
+    recorder.finish(true, 'Aborted by user')
+
+    const expectedText = 'Inspect [MemoryView.tsx](file:///Users/demo/Mem'
+    expect(streamedText.join('')).toBe(expectedText)
+    const assistantEvent = events.find((e) => e.type === 'assistant/message')!
+    const msg = assistantEvent.data.message as { content: Array<{ type: string; text: string }> }
+    expect(msg.content).toEqual([{ type: 'text', text: expectedText }])
+  })
 })
