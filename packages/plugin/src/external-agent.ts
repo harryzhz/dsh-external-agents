@@ -342,9 +342,7 @@ export class ExternalAgent implements Agent {
         selection.reasoningEffort,
       )
       const modelChangedSinceStart =
-        !freshlyConnected &&
-        this.appliedSelectionKey !== undefined &&
-        this.appliedSelectionKey !== selectionKey
+        !freshlyConnected && this.appliedSelectionKey !== selectionKey
       if (freshlyConnected) {
         this.appliedSelectionKey = selectionKey
       }
@@ -369,6 +367,10 @@ export class ExternalAgent implements Agent {
       const interrupted = abort.signal.aborted || runResult.status === 'interrupted'
       if (!interrupted && runResult.status === 'completed') {
         this.appliedSelectionKey = selectionKey
+      } else if (modelChangedSinceStart) {
+        // Remote runtime may have switched models before the turn was interrupted/failed;
+        // clear tracked state so the next turn re-applies the requested model even when switching back.
+        this.appliedSelectionKey = undefined
       }
       recorder.finish(interrupted, runResult.errorMessage)
 

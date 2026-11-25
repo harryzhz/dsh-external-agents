@@ -425,4 +425,85 @@ describe('ExternalAgent model persistence and profile fallback on cold resume', 
     // resolveProfile called once per turn (4 turns -> 4 calls, not 8)
     expect(resolveProfile).toHaveBeenCalledTimes(4)
   })
+
+  it('re-applies model A after an interrupted or failed A->B switch on a warm session', async () => {
+    const turns: Array<{ model: string; modelChangedSinceStart?: boolean }> = []
+    let turnIndex = 0
+    const runtime: ExternalRuntimeDefinition = {
+      id: 'agy',
+      displayName: 'Antigravity',
+      description: 'Test',
+      providerId: 'agy-cli',
+      defaultModel: 'model-a',
+      fallbackModels: [
+        { id: 'model-a', name: 'Model A' },
+        { id: 'model-b', name: 'Model B' },
+      ],
+      probeModels: async () => [],
+      createDriver: () => ({
+        kind: 'agy',
+        async ensureConnected() {
+          return 'ext-aba-interrupted'
+        },
+        async runTurn(request, onEvent) {
+          turnIndex += 1
+          turns.push({ model: request.model, modelChangedSinceStart: request.modelChangedSinceStart })
+          if (turnIndex === 2) {
+            return { status: 'interrupted' }
+          }
+          if (turnIndex === 4) {
+            return { status: 'failed', errorMessage: 'boom' }
+          }
+          onEvent({ type: 'text-delta', text: `ok:${request.model}` })
+          return { status: 'completed' }
+        },
+        async close() {},
+      }),
+    }
+
+    const mem = createMemorySession('session-aba-fail', 'agy')
+    const agent = new ExternalAgent({
+      rootCtx: createFakeRootCtx(),
+      id: mem.session.id,
+      runtime,
+      idleEvictMs: 0,
+      options: {},
+      session: mem.session,
+      projections: mem.projections,
+      lastTurn: 0,
+    })
+
+    // Turn 1: A completes
+    agent.model.select({ provider: 'agy-cli', model: 'model-a' })
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 't1' }] }))
+    await agent.whenIdle()
+
+    // Turn 2: switch A -> B, interrupted mid-turn (remote runtime may already be on B)
+    agent.model.select({ provider: 'agy-cli', model: 'model-b' })
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 't2' }] }))
+    await agent.whenIdle()
+
+    // Turn 3: switch back to A -> MUST report modelChangedSinceStart=true so runtime switches back
+    agent.model.select({ provider: 'agy-cli', model: 'model-a' })
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 't3' }] }))
+    await agent.whenIdle()
+
+    // Turn 4: switch A -> B, fails (remote runtime may already be on B)
+    agent.model.select({ provider: 'agy-cli', model: 'model-b' })
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 't4' }] }))
+    await agent.whenIdle()
+
+    // Turn 5: switch back to A -> MUST also report modelChangedSinceStart=true
+    agent.model.select({ provider: 'agy-cli', model: 'model-a' })
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 't5' }] }))
+    await agent.whenIdle()
+
+    expect(turns).toEqual([
+      { model: 'model-a', modelChangedSinceStart: false },
+      { model: 'model-b', modelChangedSinceStart: true },
+      { model: 'model-a', modelChangedSinceStart: true },
+      { model: 'model-b', modelChangedSinceStart: true },
+      { model: 'model-a', modelChangedSinceStart: true },
+    ])
+  })
 })
