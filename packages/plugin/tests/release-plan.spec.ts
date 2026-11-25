@@ -41,6 +41,19 @@ describe('release-plan auto-release logic', () => {
       prevTag: 'v0.4.0',
       reason: 'auto_main_merge',
     })
+
+    expect(
+      computeReleasePlan({
+        eventName: 'push',
+        ref: 'refs/heads/main',
+        headSubject: 'feat(runtime): pre-bumped milestone',
+        headTags: [],
+        existingTags: ['v0.4.0'],
+        pkgVersion: '0.5.0',
+        changedFiles: ['packages/plugin/src/index.ts'],
+        commitMessages: ['feat(runtime): pre-bumped milestone'],
+      }).tag,
+    ).toBe('v0.5.0')
   })
 
   it('skips docs-only merges and release commits cleanly', () => {
