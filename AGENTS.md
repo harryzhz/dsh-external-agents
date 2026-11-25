@@ -4,13 +4,13 @@
 
 ## 开发工作流（默认规则）
 
-- **Worktree + 分支 + PR**：新需求或修复默认基于最新 `origin/main` 在 `.worktrees/<slug>` 新建独立 worktree 与功能分支（如 `feat/<slug>`、`fix/<slug>`、`docs/<slug>`）开发，**禁止直接在 `main` 分支提交**（除非用户明确要求）。完成后推送分支并向 `main` 发起 GitHub PR，验证与 CI 通过后自动合入 `main`、清理 worktree 与已合并分支并按需优雅重启服务（详见 [docs/DEVELOPMENT.md](./docs/DEVELOPMENT.md)）。
+- **Worktree + 分支 + PR**：新需求或修复默认基于最新 `origin/main` 在 `.worktrees/<slug>` 新建独立 worktree 与功能分支（如 `feat/<slug>`、`fix/<slug>`、`docs/<slug>`）开发，**禁止直接在 `main` 分支提交**（除非用户明确要求）。完成后推送分支并向 `main` 发起 GitHub PR，验证与 CI 通过后合入 `main` 并清理 worktree 与已合并分支，**禁止在迭代合入后直接替换或重启正式本地 DSH Web 服务**（详见 [docs/DEVELOPMENT.md](./docs/DEVELOPMENT.md)）。
 - **临时产物目录**：本地研发脚本、调试日志与打包 `.tgz` 统一输出至 `.local/`（已 gitignore），严禁污染仓库根目录。
 - **合并前门禁**：提交与发起 PR 前必须全部通过：
   ```bash
   pnpm build && pnpm typecheck && pnpm test && pnpm run check:privacy
   ```
-- **端到端真实验证与自动合入重启**：除纯文档修改外，每个 PR 合入 `main` 前优先在独立隔离的本地 E2E DSH Web 实例（独立 `DSH_HOME`、独立端口与专用测试机器人/测试群，直接挂载当前 PR worktree 产物，不干扰正式环境）完成真实浏览器与飞书双机器人端到端实测；未配置独立 E2E 实例时再回退至飞书触发群或用户显式指定的验收群（**严禁将任何真实群名称、群 ID、测试机器人 ID 或宿主机路径写入文档、代码、测试或 PR**）。全部门禁、CI 与端到端验收通过后自动将 PR 合入 `main`、同步构建并优雅排空重启正式本地 DSH 服务（详见 [docs/DEVELOPMENT.md](./docs/DEVELOPMENT.md#2-端到端真实验证与自动合入重启)）。
+- **端到端真实验证与发布更新规范**：除纯文档修改外，每个 PR 合入 `main` 前优先在独立隔离的本地 E2E DSH Web 实例（独立 `DSH_HOME`、独立端口与专用测试机器人/测试群，直接挂载当前 PR worktree 产物，不干扰正式环境）完成真实浏览器与飞书双机器人端到端实测；未配置独立 E2E 实例时再回退至飞书触发群或用户显式指定的验收群（**严禁将任何真实群名称、群 ID、测试机器人 ID 或宿主机路径写入文档、代码、测试或 PR**）。全部门禁、CI 与端到端验收通过后合入 `main` 并清理 worktree，**不再自动替换或重启正式服务**；正式环境统一从 GitHub Release `.tgz` 安装并在凌晨低峰或用户明确要求时执行免重启热更新（详见 [docs/DEVELOPMENT.md](./docs/DEVELOPMENT.md#2-端到端真实验证与发布更新规范)）。
 
 ## 核心红线（每次必守）
 
