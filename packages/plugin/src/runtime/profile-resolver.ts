@@ -200,26 +200,44 @@ function readAgySettingsFile(filePath: string): AgySettingsMeta {
   }
 }
 
-function inferAgyAuthMethodId(
-  env: NodeJS.ProcessEnv,
-  settingsMeta?: AgySettingsMeta,
-  explicitAuthMethodId?: string,
-): string | undefined {
-  const explicit = explicitAuthMethodId?.trim()
-  if (explicit) return explicit
-  if (settingsMeta?.modelProvider === 'gemini') return 'gemini-api-key'
+function inferAgyAuthFromSettings(settingsMeta?: AgySettingsMeta): string | undefined {
+  if (!settingsMeta) return undefined
+  if (settingsMeta.modelProvider === 'gemini') return 'gemini-api-key'
   if (
-    settingsMeta?.modelProvider === 'vertex' ||
-    settingsMeta?.modelProvider === 'agent-platform' ||
-    settingsMeta?.hasGcpConfig
+    settingsMeta.modelProvider === 'vertex' ||
+    settingsMeta.modelProvider === 'agent-platform' ||
+    settingsMeta.hasGcpConfig
   ) {
     return 'agent-platform'
   }
+  return undefined
+}
+
+function inferAgyAuthFromEnv(env?: Readonly<Record<string, string | undefined>>): string | undefined {
+  if (!env) return undefined
   if (env.GEMINI_API_KEY?.trim()) return 'gemini-api-key'
   if (env.GOOGLE_CLOUD_PROJECT?.trim() && env.GOOGLE_CLOUD_LOCATION?.trim()) {
     return 'agent-platform'
   }
   return undefined
+}
+
+function inferAgyAuthMethodId(options: {
+  readonly env: NodeJS.ProcessEnv
+  readonly profileEnv?: Readonly<Record<string, string>>
+  readonly profileSettingsMeta?: AgySettingsMeta
+  readonly hostSettingsMeta?: AgySettingsMeta
+  readonly explicitAuthMethodId?: string
+}): string | undefined {
+  const explicit = options.explicitAuthMethodId?.trim()
+  if (explicit) return explicit
+  // Explicit profile configFile & profile env MUST take precedence over host default settings/env.
+  return (
+    inferAgyAuthFromSettings(options.profileSettingsMeta) ??
+    inferAgyAuthFromEnv(options.profileEnv) ??
+    inferAgyAuthFromSettings(options.hostSettingsMeta) ??
+    inferAgyAuthFromEnv(options.env)
+  )
 }
 
 function readClaudeSettingsFile(
@@ -592,6 +610,7 @@ function resolveAcpPlan(
   spec: ExternalRuntimeSpec,
   profile: ExternalRuntimeProfile,
   env: NodeJS.ProcessEnv,
+  profileEnv: Readonly<Record<string, string>>,
 ): ResolvedRuntimeLaunchPlan {
   const command = resolveRuntimeCommand(spec, env)
   let args = [...spec.args]
@@ -601,7 +620,8 @@ function resolveAcpPlan(
   let inferredEffort: string | undefined
 
   if (spec.id === 'agy') {
-    let settingsMeta: AgySettingsMeta | undefined
+    let profileSettingsMeta: AgySettingsMeta | undefined
+    let hostSettingsMeta: AgySettingsMeta | undefined
     if (profile.configFile) {
       const expandedSettings = expandUserPath(profile.configFile)
       if (!existsSync(expandedSettings)) {
@@ -611,13 +631,19 @@ function resolveAcpPlan(
       if (profile.argsMode !== 'replace') {
         args = ['--settings', expandedSettings, ...args]
       }
-      settingsMeta = readAgySettingsFile(expandedSettings)
-      inferredModel = settingsMeta.model
-      inferredEffort = settingsMeta.effort
+      profileSettingsMeta = readAgySettingsFile(expandedSettings)
+      inferredModel = profileSettingsMeta.model
+      inferredEffort = profileSettingsMeta.effort
     } else {
-      settingsMeta = readAgySettingsFile(defaultAgySettingsPath(env))
+      hostSettingsMeta = readAgySettingsFile(defaultAgySettingsPath(env))
     }
-    authMethodId = inferAgyAuthMethodId(env, settingsMeta, authMethodId)
+    authMethodId = inferAgyAuthMethodId({
+      env,
+      profileEnv,
+      ...(profileSettingsMeta ? { profileSettingsMeta } : {}),
+      ...(hostSettingsMeta ? { hostSettingsMeta } : {}),
+      ...(authMethodId ? { explicitAuthMethodId: authMethodId } : {}),
+    })
   } else if (spec.id === 'claude-code') {
     // Claude Code applies `~/.claude/settings.json`'s `env` after child process env, so
     // forward profile `configFile` / `env` via programmatic ACP session settings to override it.
@@ -659,7 +685,10 @@ export function resolveRuntimeLaunchPlan(
   if (!profile) {
     const authMethodId =
       spec.id === 'agy'
-        ? inferAgyAuthMethodId(env, readAgySettingsFile(defaultAgySettingsPath(env)))
+        ? inferAgyAuthMethodId({
+            env,
+            hostSettingsMeta: readAgySettingsFile(defaultAgySettingsPath(env)),
+          })
         : undefined
     return {
       command: resolveRuntimeCommand(spec, env),
@@ -674,5 +703,5 @@ export function resolveRuntimeLaunchPlan(
   if (spec.kind === 'codex-app-server') {
     return resolveCodexAppServerPlan(spec, profile, env)
   }
-  return resolveAcpPlan(spec, profile, env)
+  return resolveAcpPlan(spec, profile, env, profileEnv)
 }

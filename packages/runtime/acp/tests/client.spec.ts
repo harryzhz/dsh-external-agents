@@ -1459,4 +1459,37 @@ describe('AcpRuntimeClient prompt idle timeout', () => {
     expect(() => transport.send({ jsonrpc: '2.0', method: 'ping' })).toThrow(/transport is closed/)
     await transport.close()
   })
+
+  it('closes transport when initialize fails and ignores stale close events from prior transports', async () => {
+    const failedTransport = new MockAcpTransport((msg, t) => {
+      if (msg.method === 'initialize') {
+        t.emit({ jsonrpc: '2.0', id: msg.id, error: { code: -32000, message: 'acp init fail' } })
+      }
+    })
+    const goodTransport = new MockAcpTransport((msg, t) => {
+      if (msg.method === 'initialize') {
+        t.emit({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1, agentCapabilities: {} } })
+      } else if (msg.method === 'session/new') {
+        t.emit({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 'acp_ok' } })
+      }
+    })
+
+    let idx = 0
+    const client = new AcpRuntimeClient({
+      cwd: '/repo',
+      command: 'agent',
+      args: [],
+      transportFactory: () => (idx++ === 0 ? failedTransport : goodTransport),
+    })
+
+    await expect(client.initialize()).rejects.toThrow(/acp init fail/)
+    expect(failedTransport.closed).toBe(true)
+
+    const sid = await client.startOrResume()
+    expect(sid).toBe('acp_ok')
+    // Late close from old transport must not disturb active transport
+    failedTransport.emitClose(new Error('late stale close'))
+    expect(goodTransport.closed).toBe(false)
+    await client.close()
+  })
 })

@@ -663,4 +663,96 @@ describe('CodexRuntimeClient', () => {
     expect(() => transport.send({ jsonrpc: '2.0', method: 'ping' })).toThrow(/transport is closed/)
     await transport.close()
   })
+
+  it('conservatively forwards model/effort on next turn when thread/resume omits model echo', async () => {
+    const turnStarts: Array<Record<string, unknown>> = []
+    const transport = new MockTransport((msg, t) => {
+      if (msg.method === 'initialize') {
+        t.emit({ jsonrpc: '2.0', id: msg.id, result: {} })
+      } else if (msg.method === 'thread/resume') {
+        // Response omits `model` and `reasoningEffort`
+        t.emit({ jsonrpc: '2.0', id: msg.id, result: { thread: { id: 'thr_silent' } } })
+      } else if (msg.method === 'turn/start') {
+        turnStarts.push((msg.params ?? {}) as Record<string, unknown>)
+        t.emit({ jsonrpc: '2.0', id: msg.id, result: { turn: { id: 'turn_silent_1' } } })
+        queueMicrotask(() => {
+          t.emit({
+            jsonrpc: '2.0',
+            method: 'turn/completed',
+            params: { turn: { id: 'turn_silent_1', status: 'completed' } },
+          })
+        })
+      }
+    })
+
+    const client = new CodexRuntimeClient({ cwd: '/tmp', transportFactory: () => transport })
+    await client.startOrResume({
+      threadId: 'thr_silent',
+      model: 'gpt-5.4-pro',
+      reasoningEffort: 'xhigh',
+    })
+    await client.runTurn({ text: 'continue' })
+
+    expect(turnStarts[0]).toMatchObject({
+      threadId: 'thr_silent',
+      model: 'gpt-5.4-pro',
+      effort: 'xhigh',
+    })
+    await client.close()
+  })
+
+  it('sends turn/interrupt when abort fires before turn/start resolves, and closes transport on initialize failure', async () => {
+    // 1. initialize() failure closes transport and stale close cannot clobber next transport
+    const failedTransport = new MockTransport((msg, t) => {
+      if (msg.method === 'initialize') {
+        t.emit({ jsonrpc: '2.0', id: msg.id, error: { code: -32000, message: 'boot fail' } })
+      }
+    })
+    let turnStartResolve: (() => void) | undefined
+    const interrupts: Array<Record<string, unknown>> = []
+    const goodTransport = new MockTransport((msg, t) => {
+      if (msg.method === 'initialize') {
+        t.emit({ jsonrpc: '2.0', id: msg.id, result: {} })
+      } else if (msg.method === 'thread/start') {
+        t.emit({ jsonrpc: '2.0', id: msg.id, result: { thread: { id: 'thr_race' } } })
+      } else if (msg.method === 'turn/start') {
+        turnStartResolve = () => {
+          t.emit({ jsonrpc: '2.0', id: msg.id, result: { turn: { id: 'turn_late_id' } } })
+        }
+      } else if (msg.method === 'turn/interrupt') {
+        interrupts.push((msg.params ?? {}) as Record<string, unknown>)
+        t.emit({ jsonrpc: '2.0', id: msg.id, result: {} })
+        t.emit({
+          jsonrpc: '2.0',
+          method: 'turn/completed',
+          params: { turn: { id: 'turn_late_id', status: 'interrupted' } },
+        })
+      }
+    })
+
+    let attempt = 0
+    const client = new CodexRuntimeClient({
+      cwd: '/tmp',
+      transportFactory: () => (attempt++ === 0 ? failedTransport : goodTransport),
+    })
+
+    await expect(client.initialize()).rejects.toThrow(/boot fail/)
+    expect(failedTransport.closed).toBe(true)
+
+    // Next init succeeds; stale close from failedTransport must not reset goodTransport
+    await client.startOrResume()
+    failedTransport.emitClose(new Error('stale close'))
+
+    // 2. Abort before turn/start resolves -> interrupt fires once nativeTurnId arrives
+    const ac = new AbortController()
+    const runPromise = client.runTurn({ text: 'slow start' }, {}, ac.signal)
+    ac.abort('user-cancel')
+    expect(interrupts).toHaveLength(0)
+
+    turnStartResolve?.()
+    const res = await runPromise
+    expect(res.status).toBe('interrupted')
+    expect(interrupts).toEqual([{ threadId: 'thr_race', turnId: 'turn_late_id' }])
+    await client.close()
+  })
 })

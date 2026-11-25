@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -619,5 +619,67 @@ describe('ExternalRuntimeRegistry dynamic exposed profile presets', () => {
       model: 'gemini-4-carbon',
       reasoningEffort: 'medium',
     })
+  })
+
+  it('prioritizes explicit profile env over host default agy settings.json and caches local profile discovery within TTL', () => {
+    const hostHome = makeTempDir('agy-host-home-')
+    const agyDir = join(hostHome, '.gemini', 'antigravity')
+    mkdirSync(agyDir, { recursive: true })
+    // Host default settings.json selects agent-platform / GCP
+    writeFileSync(
+      join(agyDir, 'settings.json'),
+      JSON.stringify({ modelProvider: 'agent-platform', gcp: { project: 'host-proj', location: 'global' } }),
+    )
+
+    const specs = resolveRuntimeSpecs([])
+    const agySpec = specs.find((s) => s.id === 'agy')!
+
+    // 1. Profile explicit GEMINI_API_KEY must beat host default settings.json (agent-platform)
+    const apiKeyProfilePlan = resolveRuntimeLaunchPlan(
+      agySpec,
+      {
+        id: 'api-key-only',
+        runtimeId: 'agy',
+        name: 'API Key Only',
+        source: 'user',
+        env: { GEMINI_API_KEY: 'profile-gemini-key' },
+      },
+      { HOME: hostHome },
+    )
+    expect(apiKeyProfilePlan.authMethodId).toBe('gemini-api-key')
+
+    // 2. Profile explicit GCP env must beat host process.env GEMINI_API_KEY
+    const gcpProfilePlan = resolveRuntimeLaunchPlan(
+      agySpec,
+      {
+        id: 'gcp-env-only',
+        runtimeId: 'agy',
+        name: 'GCP Env Only',
+        source: 'user',
+        env: { GOOGLE_CLOUD_PROJECT: 'prof-proj', GOOGLE_CLOUD_LOCATION: 'us-central1' },
+      },
+      { HOME: hostHome, GEMINI_API_KEY: 'host-gemini-key' },
+    )
+    expect(gcpProfilePlan.authMethodId).toBe('agent-platform')
+
+    // 3. Discovery cache avoids repeated disk scans within TTL and refreshes after invalidation
+    const codexHome = makeTempDir('codex-cache-home-')
+    const dataDir = makeTempDir('store-cache-data-')
+    writeFileSync(join(codexHome, 'alpha.config.toml'), 'model = "gpt-5.4"\n')
+    const store = new RuntimeProfileStore({
+      dataDir,
+      specs,
+      discoveryCacheTtlMs: 60_000,
+      processEnv: { ...process.env, CODEX_HOME: codexHome },
+    })
+
+    expect(store.list('codex').map((p) => p.id)).toEqual(['alpha'])
+
+    // Add a second profile file on disk; still served from TTL cache until invalidated
+    writeFileSync(join(codexHome, 'beta.config.toml'), 'model = "gpt-5.5"\n')
+    expect(store.list('codex').map((p) => p.id)).toEqual(['alpha'])
+
+    store.invalidateDiscoveryCache('codex')
+    expect(store.list('codex').map((p) => p.id).sort()).toEqual(['alpha', 'beta'])
   })
 })

@@ -306,16 +306,19 @@ function profileCompositeKey(runtimeId: string, profileId: string): string {
   return `${runtimeId}:${profileId}`
 }
 
+const DEFAULT_DISCOVERY_CACHE_TTL_MS = 5_000
+
 export interface RuntimeProfileStoreOptions {
   readonly dataDir?: string
   readonly specs: readonly ExternalRuntimeSpec[]
   readonly enableDiscovery?: boolean
+  readonly discoveryCacheTtlMs?: number
   readonly processEnv?: NodeJS.ProcessEnv
 }
 
 /**
  * Manages runtime launch profiles across three layers:
- * 1) Local CLI auto-discovery (read-only)
+ * 1) Local CLI auto-discovery (read-only, short-TTL cached)
  * 2) `cordis.patch.yml` declarative entries (read-only)
  * 3) User-managed persisted profiles in `<dataDir>/profiles.json` (`0600`)
  */
@@ -325,13 +328,22 @@ export class RuntimeProfileStore {
   private readonly specsById = new Map<string, ExternalRuntimeSpec>()
   private readonly configProfiles = new Map<string, ExternalRuntimeProfile>()
   private readonly userProfiles = new Map<string, ExternalRuntimeProfile>()
+  private readonly discoveryCache = new Map<
+    string,
+    { readonly expiresAtMs: number; readonly profiles: readonly ExternalRuntimeProfile[] }
+  >()
   private readonly enableDiscovery: boolean
+  private readonly discoveryCacheTtlMs: number
   private readonly processEnv: NodeJS.ProcessEnv
 
   constructor(options: RuntimeProfileStoreOptions) {
     this.dataDir = options.dataDir?.trim() || defaultExternalAgentsDataDir()
     this.filePath = join(this.dataDir, 'profiles.json')
     this.enableDiscovery = options.enableDiscovery !== false
+    this.discoveryCacheTtlMs =
+      typeof options.discoveryCacheTtlMs === 'number' && options.discoveryCacheTtlMs >= 0
+        ? options.discoveryCacheTtlMs
+        : DEFAULT_DISCOVERY_CACHE_TTL_MS
     this.processEnv = options.processEnv ?? process.env
 
     for (const spec of options.specs) {
@@ -439,17 +451,45 @@ export class RuntimeProfileStore {
     }
 
     this.userProfiles.set(key, saved)
+    this.discoveryCache.delete(runtimeId)
     this.persistUserProfiles()
     return saved
   }
 
   delete(runtimeId: string, profileId: string): boolean {
-    const key = profileCompositeKey(runtimeId.trim(), profileId.trim())
+    const cleanRuntime = runtimeId.trim()
+    const key = profileCompositeKey(cleanRuntime, profileId.trim())
     const existed = this.userProfiles.delete(key)
     if (existed) {
+      this.discoveryCache.delete(cleanRuntime)
       this.persistUserProfiles()
     }
     return existed
+  }
+
+  invalidateDiscoveryCache(runtimeId?: string): void {
+    if (runtimeId?.trim()) {
+      this.discoveryCache.delete(runtimeId.trim())
+    } else {
+      this.discoveryCache.clear()
+    }
+  }
+
+  private getDiscoveredProfiles(spec: ExternalRuntimeSpec): readonly ExternalRuntimeProfile[] {
+    if (this.discoveryCacheTtlMs <= 0) {
+      return discoverLocalProfiles(spec, this.processEnv)
+    }
+    const now = Date.now()
+    const cached = this.discoveryCache.get(spec.id)
+    if (cached && now < cached.expiresAtMs) {
+      return cached.profiles
+    }
+    const profiles = discoverLocalProfiles(spec, this.processEnv)
+    this.discoveryCache.set(spec.id, {
+      expiresAtMs: now + this.discoveryCacheTtlMs,
+      profiles,
+    })
+    return profiles
   }
 
   private buildMergedMap(filterRuntimeId?: string): Map<string, ExternalRuntimeProfile> {
@@ -460,7 +500,7 @@ export class RuntimeProfileStore {
 
     if (this.enableDiscovery) {
       for (const spec of targetSpecs) {
-        for (const disc of discoverLocalProfiles(spec, this.processEnv)) {
+        for (const disc of this.getDiscoveredProfiles(spec)) {
           merged.set(profileCompositeKey(disc.runtimeId, disc.id), disc)
         }
       }

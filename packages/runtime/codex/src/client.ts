@@ -61,6 +61,7 @@ interface PendingRequest {
 
 interface ActiveTurnState {
   nativeTurnId?: string
+  cancelRequested?: boolean
   text: string
   currentItemStreamed: boolean
   usage?: CodexTokenUsage
@@ -220,14 +221,23 @@ export class CodexRuntimeClient {
     })
     this.transport = transport
     transport.onMessage((msg) => this.handleMessage(msg))
-    transport.onClose((err) => this.handleTransportClosed(err))
+    transport.onClose((err) => this.handleTransportClosed(transport, err))
 
-    await this.request('initialize', {
-      clientInfo: { name: this.clientName, version: this.clientVersion },
-      capabilities: { experimentalApi: true },
-    })
-    this.notify('initialized', {})
-    this.initialized = true
+    try {
+      await this.request('initialize', {
+        clientInfo: { name: this.clientName, version: this.clientVersion },
+        capabilities: { experimentalApi: true },
+      })
+      this.notify('initialized', {})
+      this.initialized = true
+    } catch (err) {
+      if (this.transport === transport) {
+        this.transport = undefined
+        this.initialized = false
+      }
+      await transport.close().catch(() => {})
+      throw err
+    }
   }
 
   async startOrResume(options: CodexStartOptions = {}): Promise<string> {
@@ -269,11 +279,11 @@ export class CodexRuntimeClient {
             typeof res?.reasoningEffort === 'string' && res.reasoningEffort
               ? res.reasoningEffort
               : undefined
-          const modelDiffers = Boolean(options.model && resumedModel && options.model !== resumedModel)
-          const effortDiffers = Boolean(
-            options.reasoningEffort && resumedEffort && options.reasoningEffort !== resumedEffort,
+          const modelNeedsApply = Boolean(options.model && (!resumedModel || options.model !== resumedModel))
+          const effortNeedsApply = Boolean(
+            options.reasoningEffort && (!resumedEffort || options.reasoningEffort !== resumedEffort),
           )
-          if (modelDiffers || effortDiffers) {
+          if (modelNeedsApply || effortNeedsApply) {
             this.pendingTurnSelection = {
               ...(options.model ? { model: options.model } : {}),
               ...(options.reasoningEffort ? { reasoningEffort: options.reasoningEffort } : {}),
@@ -365,6 +375,7 @@ export class CodexRuntimeClient {
       }
 
       const onExternalAbort = () => {
+        state.cancelRequested = true
         turnAbort.abort(signal?.reason)
         void this.interruptActiveTurn()
       }
@@ -411,7 +422,11 @@ export class CodexRuntimeClient {
         .then((res) => {
           const nativeId = (res as { turn?: { id?: string } } | undefined)?.turn?.id
           if (nativeId && this.activeTurn === state) {
+            const wasUnset = !state.nativeTurnId
             state.nativeTurnId = nativeId
+            if (wasUnset && state.cancelRequested) {
+              void this.interruptActiveTurn()
+            }
           }
         })
         .catch((err: unknown) => {
@@ -613,7 +628,13 @@ export class CodexRuntimeClient {
 
     if (method === 'turn/started') {
       const nativeId = (params as { turn?: { id?: string } } | undefined)?.turn?.id
-      if (nativeId) turn.nativeTurnId = nativeId
+      if (nativeId) {
+        const wasUnset = !turn.nativeTurnId
+        turn.nativeTurnId = nativeId
+        if (wasUnset && turn.cancelRequested) {
+          void this.interruptActiveTurn()
+        }
+      }
       return
     }
 
@@ -657,7 +678,8 @@ export class CodexRuntimeClient {
     }
   }
 
-  private handleTransportClosed(error?: Error): void {
+  private handleTransportClosed(closedTransport: JsonRpcTransport, error?: Error): void {
+    if (this.transport !== closedTransport) return
     this.initialized = false
     this.transport = undefined
     this.pendingTurnSelection = undefined
