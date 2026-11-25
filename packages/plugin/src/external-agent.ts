@@ -122,7 +122,7 @@ export class ExternalAgent implements Agent {
   private activeCancelCause: AgentCancelCause = { kind: 'user' }
   private driver: ExternalRuntimeDriver | null = null
   private driverRuntimeKey?: string
-  private initialSelectionKey?: string
+  private appliedSelectionKey?: string
   private idleTimer: ReturnType<typeof setTimeout> | null = null
   private disposed = false
 
@@ -191,6 +191,7 @@ export class ExternalAgent implements Agent {
     this.clearIdleTimer()
     const drv = this.driver
     this.driver = null
+    this.appliedSelectionKey = undefined
     if (drv) {
       await drv.close()
     }
@@ -224,9 +225,10 @@ export class ExternalAgent implements Agent {
    * provider; when unset, resolves profile-inferred defaults and the live catalog's
    * default model before falling back to the base runtime's static default id.
    */
-  private async resolveSelection(): Promise<{ provider: string; model: string; reasoningEffort?: string }> {
-    const activeRuntime = this.runtime
-    const activeProfile = this.resolveActiveProfile(activeRuntime)
+  private async resolveSelection(
+    activeRuntime: ExternalRuntimeDefinition,
+    activeProfile?: ExternalRuntimeProfile,
+  ): Promise<{ provider: string; model: string; reasoningEffort?: string }> {
     const current = this.model.current()
     const provider = activeRuntime.providerId
     const matched = current?.provider === provider ? current : undefined
@@ -308,7 +310,9 @@ export class ExternalAgent implements Agent {
       return
     }
 
-    const selection = await this.resolveSelection()
+    const activeRuntime = this.runtime
+    const activeProfile = this.resolveActiveProfile(activeRuntime)
+    const selection = await this.resolveSelection(activeRuntime, activeProfile)
     this.persistSelection(selection)
     const recorder = new ExternalStepRecorder({
       agentId: this.id,
@@ -329,12 +333,21 @@ export class ExternalAgent implements Agent {
     }
 
     const selectionKey = `${selection.provider}/${selection.model}/${selection.reasoningEffort ?? ''}`
-    const modelChangedSinceStart =
-      this.initialSelectionKey !== undefined && this.initialSelectionKey !== selectionKey
 
     try {
-      const driver = await this.ensureDriver(selection.model, selection.reasoningEffort)
-      this.initialSelectionKey ??= selectionKey
+      const { driver, freshlyConnected } = await this.ensureDriver(
+        activeRuntime,
+        activeProfile,
+        selection.model,
+        selection.reasoningEffort,
+      )
+      const modelChangedSinceStart =
+        !freshlyConnected &&
+        this.appliedSelectionKey !== undefined &&
+        this.appliedSelectionKey !== selectionKey
+      if (freshlyConnected) {
+        this.appliedSelectionKey = selectionKey
+      }
 
       const runResult = await driver.runTurn(
         {
@@ -354,6 +367,9 @@ export class ExternalAgent implements Agent {
       )
 
       const interrupted = abort.signal.aborted || runResult.status === 'interrupted'
+      if (!interrupted && runResult.status === 'completed') {
+        this.appliedSelectionKey = selectionKey
+      }
       recorder.finish(interrupted, runResult.errorMessage)
 
       if (!interrupted && runResult.status === 'completed') {
@@ -400,20 +416,26 @@ export class ExternalAgent implements Agent {
     }
   }
 
-  private async ensureDriver(model: string, reasoningEffort?: string): Promise<ExternalRuntimeDriver> {
-    const activeRuntime = this.runtime
-    const activeProfile = this.resolveActiveProfile(activeRuntime)
+  private async ensureDriver(
+    activeRuntime: ExternalRuntimeDefinition,
+    activeProfile: ExternalRuntimeProfile | undefined,
+    model: string,
+    reasoningEffort?: string,
+  ): Promise<{ readonly driver: ExternalRuntimeDriver; readonly freshlyConnected: boolean }> {
     const runtimeKey = activeProfile ? `${activeRuntime.id}#${activeProfile.id}` : activeRuntime.id
+    let freshlyConnected = false
     if (!this.driver || this.driverRuntimeKey !== runtimeKey) {
       if (this.driver) {
         await this.driver.close().catch(() => {})
       }
+      this.appliedSelectionKey = undefined
       this.driver = activeRuntime.createDriver({
         ctx: this.rootCtx,
         agent: this,
         ...(activeProfile ? { profile: activeProfile } : {}),
       })
       this.driverRuntimeKey = runtimeKey
+      freshlyConnected = true
     }
     const bindingDriverKey = activeRuntime.parentRuntimeId ?? activeRuntime.id
     const persistedId =
@@ -428,7 +450,7 @@ export class ExternalAgent implements Agent {
         externalId,
       })
     }
-    return this.driver
+    return { driver: this.driver, freshlyConnected }
   }
 
   private maybeSetSessionTitle(title: string): void {
@@ -467,6 +489,7 @@ export class ExternalAgent implements Agent {
     this.clearIdleTimer()
     const drv = this.driver
     this.driver = null
+    this.appliedSelectionKey = undefined
     if (drv) {
       await drv.close().catch(() => {})
     }

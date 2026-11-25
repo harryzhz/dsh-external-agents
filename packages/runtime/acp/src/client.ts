@@ -142,22 +142,32 @@ export class AcpRuntimeClient {
     })
     this.transport = transport
     transport.onMessage((msg) => this.handleMessage(msg))
-    transport.onClose((err) => this.handleTransportClosed(err))
+    transport.onClose((err) => this.handleTransportClosed(transport, err))
 
-    const raw = await this.request(
-      'initialize',
-      {
-        protocolVersion: 1,
-        clientCapabilities: {
-          fs: { readTextFile: false, writeTextFile: false },
-          terminal: false,
+    try {
+      const raw = await this.request(
+        'initialize',
+        {
+          protocolVersion: 1,
+          clientCapabilities: {
+            fs: { readTextFile: false, writeTextFile: false },
+            terminal: false,
+          },
+          clientInfo: { name: this.clientName, version: this.clientVersion },
         },
-        clientInfo: { name: this.clientName, version: this.clientVersion },
-      },
-      Math.max(this.requestTimeoutMs, STARTUP_TIMEOUT_MS),
-    )
-    this.initResult = parseAcpInitializeResult(raw)
-    return this.initResult
+        Math.max(this.requestTimeoutMs, STARTUP_TIMEOUT_MS),
+      )
+      this.initResult = parseAcpInitializeResult(raw)
+      return this.initResult
+    } catch (err) {
+      if (this.transport === transport) {
+        this.transport = undefined
+        this.initResult = undefined
+        this.authenticatedMethodId = undefined
+      }
+      await transport.close().catch(() => {})
+      throw err
+    }
   }
 
   async authenticate(methodId: string): Promise<void> {
@@ -738,7 +748,8 @@ export class AcpRuntimeClient {
     }
   }
 
-  private handleTransportClosed(error?: Error): void {
+  private handleTransportClosed(closedTransport: AcpJsonRpcTransport, error?: Error): void {
+    if (this.transport !== closedTransport) return
     this.initResult = undefined
     this.authenticatedMethodId = undefined
     this.transport = undefined

@@ -337,4 +337,92 @@ describe('ExternalAgent model persistence and profile fallback on cold resume', 
 
     expect(observedTurns[1]).toEqual({ model: 'gemini-4-carbon', effort: 'medium' })
   })
+
+  it('tracks appliedSelectionKey across A->B->A model switches and resolves profile only once per turn', async () => {
+    const profile: ExternalRuntimeProfile = {
+      id: 'p1',
+      runtimeId: 'agy',
+      name: 'P1',
+      source: 'user',
+      defaultModel: 'model-a',
+    }
+    const resolveProfile = vi.fn((runtimeId: string, profileId: string) =>
+      runtimeId === 'agy' && profileId === 'p1' ? profile : undefined,
+    )
+    const turns: Array<{ model: string; modelChangedSinceStart?: boolean }> = []
+    const runtime: ExternalRuntimeDefinition = {
+      id: 'agy',
+      displayName: 'Antigravity',
+      description: 'Test',
+      providerId: 'agy-cli',
+      defaultModel: 'model-a',
+      fallbackModels: [
+        { id: 'model-a', name: 'Model A' },
+        { id: 'model-b', name: 'Model B' },
+      ],
+      probeModels: async () => [],
+      createDriver: () => ({
+        kind: 'agy',
+        async ensureConnected() {
+          return 'ext-aba'
+        },
+        async runTurn(request, onEvent) {
+          turns.push({ model: request.model, modelChangedSinceStart: request.modelChangedSinceStart })
+          onEvent({ type: 'text-delta', text: `ok:${request.model}` })
+          return { status: 'completed' }
+        },
+        async close() {},
+      }),
+    }
+
+    const seed = [
+      {
+        type: EXTERNAL_LAUNCH_RECORD_TYPE,
+        seq: 0,
+        time: Date.now(),
+        data: { runtimeId: 'agy', profileId: 'p1' },
+        ignorable: true,
+      },
+    ] as unknown as SessionEvent[]
+    const mem = createMemorySession('session-aba', 'agy', seed)
+    const agent = new ExternalAgent({
+      rootCtx: createFakeRootCtx(),
+      id: mem.session.id,
+      runtime,
+      resolveProfile,
+      idleEvictMs: 0,
+      options: {},
+      session: mem.session,
+      projections: mem.projections,
+      lastTurn: 0,
+    })
+
+    // Turn 1: model-a (fresh driver -> modelChangedSinceStart=false)
+    agent.model.select({ provider: 'agy-cli', model: 'model-a' })
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 't1' }] }))
+    await agent.whenIdle()
+
+    // Turn 2: switch to model-b (A -> B -> modelChangedSinceStart=true)
+    agent.model.select({ provider: 'agy-cli', model: 'model-b' })
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 't2' }] }))
+    await agent.whenIdle()
+
+    // Turn 3: switch back to model-a (B -> A -> MUST also be modelChangedSinceStart=true)
+    agent.model.select({ provider: 'agy-cli', model: 'model-a' })
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 't3' }] }))
+    await agent.whenIdle()
+
+    // Turn 4: stay on model-a (A -> A -> modelChangedSinceStart=false)
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 't4' }] }))
+    await agent.whenIdle()
+
+    expect(turns).toEqual([
+      { model: 'model-a', modelChangedSinceStart: false },
+      { model: 'model-b', modelChangedSinceStart: true },
+      { model: 'model-a', modelChangedSinceStart: true },
+      { model: 'model-a', modelChangedSinceStart: false },
+    ])
+    // resolveProfile called once per turn (4 turns -> 4 calls, not 8)
+    expect(resolveProfile).toHaveBeenCalledTimes(4)
+  })
 })
