@@ -186,6 +186,11 @@ export interface AcpRuntimeOptions {
    * or permission activity arrives. Defaults to 30 minutes; set `0` to disable.
    */
   readonly promptIdleTimeoutMs?: number
+  /**
+   * Grace timeout (ms) after an external abort sends `session/cancel` before forcibly
+   * settling the pending `session/prompt` request. Defaults to 5 seconds.
+   */
+  readonly cancelGraceTimeoutMs?: number
   readonly clientName?: string
   readonly clientVersion?: string
   readonly logger?: (message: string) => void

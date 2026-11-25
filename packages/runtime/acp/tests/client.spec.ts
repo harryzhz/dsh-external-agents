@@ -1349,4 +1349,114 @@ describe('AcpRuntimeClient prompt idle timeout', () => {
       vi.useRealTimers()
     }
   })
+
+  it('bounds external abort with cancelGraceTimeoutMs even when updates keep arriving and cancels stray permissions', async () => {
+    vi.useFakeTimers()
+    try {
+      const transport = new MockAcpTransport((msg, t) => {
+        if (msg.method === 'initialize') {
+          t.emit({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1 } })
+        } else if (msg.method === 'session/new') {
+          t.emit({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 'acp_abort' } })
+        }
+      })
+
+      const client = new AcpRuntimeClient({
+        cwd: '/repo',
+        command: 'agent',
+        args: [],
+        promptIdleTimeoutMs: 60_000,
+        cancelGraceTimeoutMs: 50,
+        transportFactory: () => transport,
+      })
+      await client.startOrResume()
+
+      // 1. Stray permission request when no activeTurn exists MUST be cancelled (never auto-approved)
+      transport.emit({
+        jsonrpc: '2.0',
+        id: 701,
+        method: 'session/request_permission',
+        params: {
+          sessionId: 'acp_abort',
+          toolCall: { toolCallId: 'tc_stray', name: 'bash', title: 'Stray tool' },
+          options: [{ optionId: 'allow_always', name: 'Always', kind: 'allow_always' }],
+        },
+      })
+      await Promise.resolve()
+      expect(transport.sent).toContainEqual({
+        jsonrpc: '2.0',
+        id: 701,
+        result: { outcome: { outcome: 'cancelled' } },
+      })
+
+      // 2. External abort switches to short cancel grace timeout and ignores ongoing updates
+      const ac = new AbortController()
+      const turnPromise = client.runTurn([{ type: 'text', text: 'unresponsive peer' }], {}, ac.signal)
+      const expectation = expect(turnPromise).rejects.toThrow(/cancel timed out after 50ms/)
+
+      ac.abort(new Error('user cancelled'))
+      expect(transport.sent).toContainEqual({
+        jsonrpc: '2.0',
+        method: 'session/cancel',
+        params: { sessionId: 'acp_abort' },
+      })
+
+      // Permission arriving while cancelPending is also rejected as cancelled
+      transport.emit({
+        jsonrpc: '2.0',
+        id: 702,
+        method: 'session/request_permission',
+        params: {
+          sessionId: 'acp_abort',
+          toolCall: { toolCallId: 'tc_cancelling', name: 'bash', title: 'Late tool' },
+          options: [{ optionId: 'allow_once', name: 'Allow', kind: 'allow_once' }],
+        },
+      })
+      await Promise.resolve()
+      expect(transport.sent).toContainEqual({
+        jsonrpc: '2.0',
+        id: 702,
+        result: { outcome: { outcome: 'cancelled' } },
+      })
+
+      // Streaming updates during cancel grace must NOT extend the timer back to 60s
+      await vi.advanceTimersByTimeAsync(30)
+      transport.emit({
+        jsonrpc: '2.0',
+        method: 'session/update',
+        params: {
+          sessionId: 'acp_abort',
+          update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'still streaming' } },
+        },
+      })
+      await vi.advanceTimersByTimeAsync(30)
+      await expectation
+
+      await client.close()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('AcpStdioTransport converts async stdin EPIPE errors into controlled onClose without crashing host', async () => {
+    const { AcpStdioTransport } = await import('../src/stdio-transport.js')
+    const transport = new AcpStdioTransport({
+      command: process.execPath,
+      args: ['-e', 'setTimeout(() => {}, 5000)'],
+      cwd: process.cwd(),
+      env: process.env,
+    })
+
+    const closedErrors: Array<Error | undefined> = []
+    transport.onClose((err) => closedErrors.push(err))
+
+    const child = (transport as unknown as { child: { stdin: { emit: (ev: string, err: Error) => void } } }).child
+    const epipe = Object.assign(new Error('write EPIPE'), { code: 'EPIPE' })
+    child.stdin.emit('error', epipe)
+
+    expect(closedErrors).toHaveLength(1)
+    expect(closedErrors[0]?.message).toContain('stdin error: write EPIPE')
+    expect(() => transport.send({ jsonrpc: '2.0', method: 'ping' })).toThrow(/transport is closed/)
+    await transport.close()
+  })
 })

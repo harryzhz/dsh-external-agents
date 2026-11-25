@@ -50,6 +50,13 @@ export class AcpStdioTransport implements AcpJsonRpcTransport {
     this.rl = createInterface({ input: this.child.stdout })
     this.rl.on('line', (line) => this.handleLine(line))
 
+    this.child.stdin.on('error', (err) => {
+      if (this.closed) return
+      const detail = this.stderrTail.trim()
+      const suffix = detail ? `\n${detail}` : ''
+      this.notifyClosed(new Error(`${this.label} stdin error: ${err.message}${suffix}`))
+    })
+
     this.child.once('error', (err) => {
       this.notifyClosed(new Error(`${this.label} spawn error: ${err.message}`))
     })
@@ -67,10 +74,18 @@ export class AcpStdioTransport implements AcpJsonRpcTransport {
   }
 
   send(message: AcpJsonRpcMessage): void {
-    if (this.closed || !this.child.stdin || this.child.stdin.destroyed) {
+    if (this.closed || !this.child.stdin || this.child.stdin.destroyed || this.child.stdin.writableEnded) {
       throw new Error(`${this.label} transport is closed`)
     }
-    this.child.stdin.write(`${JSON.stringify(message)}\n`)
+    try {
+      this.child.stdin.write(`${JSON.stringify(message)}\n`)
+    } catch (err) {
+      const error = new Error(
+        `${this.label} stdin write failed: ${err instanceof Error ? err.message : String(err)}`,
+      )
+      this.notifyClosed(error)
+      throw error
+    }
   }
 
   onMessage(listener: (message: AcpJsonRpcMessage) => void): () => void {

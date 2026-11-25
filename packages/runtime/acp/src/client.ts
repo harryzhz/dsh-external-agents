@@ -34,6 +34,7 @@ const STARTUP_TIMEOUT_MS = 5 * 60_000
  * runs are never terminated mid-progress.
  */
 export const DEFAULT_PROMPT_IDLE_TIMEOUT_MS = 30 * 60_000
+export const DEFAULT_CANCEL_GRACE_TIMEOUT_MS = 5_000
 
 interface PendingRequest {
   readonly method: string
@@ -45,12 +46,14 @@ interface PendingRequest {
 interface ActiveTurnContext {
   text: string
   usage?: AcpTokenUsage
+  cancelPending: boolean
   readonly activeTools: Map<string, AcpActiveToolCall>
   readonly handlers: AcpTurnHandlers
   readonly abortController: AbortController
   touchActivity?: () => void
   pauseIdleTimer?: () => void
   resumeIdleTimer?: () => void
+  beginCancelGrace?: () => void
 }
 
 interface OpenedSession {
@@ -69,6 +72,7 @@ export class AcpRuntimeClient {
   private readonly label: string
   private readonly requestTimeoutMs: number
   private readonly promptIdleTimeoutMs: number
+  private readonly cancelGraceTimeoutMs: number
   private readonly clientName: string
   private readonly clientVersion: string
   private readonly logger: (message: string) => void
@@ -100,6 +104,10 @@ export class AcpRuntimeClient {
       options.promptIdleTimeoutMs !== undefined && Number.isFinite(options.promptIdleTimeoutMs)
         ? Math.max(0, options.promptIdleTimeoutMs)
         : DEFAULT_PROMPT_IDLE_TIMEOUT_MS
+    this.cancelGraceTimeoutMs =
+      options.cancelGraceTimeoutMs !== undefined && Number.isFinite(options.cancelGraceTimeoutMs)
+        ? Math.max(10, options.cancelGraceTimeoutMs)
+        : DEFAULT_CANCEL_GRACE_TIMEOUT_MS
     this.clientName = options.clientName ?? 'dsh-external-agents'
     this.clientVersion = options.clientVersion ?? '0.1.0'
     this.logger = options.logger ?? (() => {})
@@ -304,6 +312,7 @@ export class AcpRuntimeClient {
     const abortController = new AbortController()
     const turn: ActiveTurnContext = {
       text: '',
+      cancelPending: false,
       activeTools: new Map(),
       handlers,
       abortController,
@@ -311,7 +320,9 @@ export class AcpRuntimeClient {
     this.activeTurn = turn
 
     const onExternalAbort = () => {
+      turn.cancelPending = true
       abortController.abort(signal?.reason)
+      turn.beginCancelGrace?.()
       this.notify('session/cancel', { sessionId: this.currentSessionId })
     }
     signal?.addEventListener('abort', onExternalAbort, { once: true })
@@ -540,13 +551,14 @@ export class AcpRuntimeClient {
 
       const armIdleTimer = () => {
         clearIdleTimer()
-        if (idleTimeoutMs <= 0 || pendingPermissions > 0 || !this.pending.has(id)) return
+        if (turn.cancelPending || idleTimeoutMs <= 0 || pendingPermissions > 0 || !this.pending.has(id)) return
         entry.timer = setTimeout(() => {
           if (!this.pending.delete(id)) return
           entry.timer = undefined
           const err = new Error(
             `${this.label} RPC "session/prompt" idle timed out after ${idleTimeoutMs}ms without updates`,
           )
+          turn.cancelPending = true
           turn.abortController.abort(err)
           this.notify('session/cancel', { sessionId })
           reject(err)
@@ -555,6 +567,7 @@ export class AcpRuntimeClient {
       }
 
       turn.touchActivity = () => {
+        if (turn.cancelPending) return
         armIdleTimer()
       }
       turn.pauseIdleTimer = () => {
@@ -563,11 +576,30 @@ export class AcpRuntimeClient {
       }
       turn.resumeIdleTimer = () => {
         pendingPermissions = Math.max(0, pendingPermissions - 1)
+        if (turn.cancelPending) return
         armIdleTimer()
+      }
+      turn.beginCancelGrace = () => {
+        clearIdleTimer()
+        if (!this.pending.has(id)) return
+        entry.timer = setTimeout(() => {
+          if (!this.pending.delete(id)) return
+          entry.timer = undefined
+          reject(
+            new Error(
+              `${this.label} RPC "session/prompt" cancel timed out after ${this.cancelGraceTimeoutMs}ms`,
+            ),
+          )
+        }, this.cancelGraceTimeoutMs)
+        entry.timer.unref?.()
       }
 
       this.pending.set(id, entry)
-      armIdleTimer()
+      if (turn.cancelPending) {
+        turn.beginCancelGrace()
+      } else {
+        armIdleTimer()
+      }
       try {
         this.transport!.send({
           jsonrpc: '2.0',
@@ -657,9 +689,13 @@ export class AcpRuntimeClient {
 
     const request = normalizeAcpPermissionRequest(params)
     const turn = this.activeTurn
-    const handler = turn?.handlers.onPermission
+    if (!turn || turn.cancelPending) {
+      this.respond(id, { outcome: { outcome: 'cancelled' } })
+      return
+    }
+    const handler = turn.handlers.onPermission
     if (!handler) {
-      turn?.touchActivity?.()
+      turn.touchActivity?.()
       const optionId = pickDefaultAllowOptionId(request.options)
       this.respond(
         id,

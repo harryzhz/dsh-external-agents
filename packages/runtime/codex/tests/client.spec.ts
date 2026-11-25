@@ -641,4 +641,26 @@ describe('CodexRuntimeClient', () => {
       toolName: 'apply_patch',
     })
   })
+
+  it('CodexStdioTransport converts async stdin EPIPE errors into controlled onClose without crashing host', async () => {
+    const { CodexStdioTransport } = await import('../src/stdio-transport.js')
+    const transport = new CodexStdioTransport({
+      cliBin: process.execPath,
+      args: ['-e', 'setTimeout(() => {}, 5000)'],
+      cwd: process.cwd(),
+      env: process.env,
+    })
+
+    const closedErrors: Array<Error | undefined> = []
+    transport.onClose((err) => closedErrors.push(err))
+
+    const child = (transport as unknown as { child: { stdin: { emit: (ev: string, err: Error) => void } } }).child
+    const epipe = Object.assign(new Error('write EPIPE'), { code: 'EPIPE' })
+    child.stdin.emit('error', epipe)
+
+    expect(closedErrors).toHaveLength(1)
+    expect(closedErrors[0]?.message).toContain('stdin error: write EPIPE')
+    expect(() => transport.send({ jsonrpc: '2.0', method: 'ping' })).toThrow(/transport is closed/)
+    await transport.close()
+  })
 })
