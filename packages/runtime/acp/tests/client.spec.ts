@@ -1349,4 +1349,136 @@ describe('AcpRuntimeClient prompt idle timeout', () => {
       vi.useRealTimers()
     }
   })
+
+  it('rejects within cancelGraceTimeoutMs when external signal aborts even if peer keeps streaming updates', async () => {
+    vi.useFakeTimers()
+    try {
+      const transport = new MockAcpTransport((msg, t) => {
+        if (msg.method === 'initialize') {
+          t.emit({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1 } })
+        } else if (msg.method === 'session/new') {
+          t.emit({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 'acp_cancel_hang' } })
+        }
+      })
+
+      const client = new AcpRuntimeClient({
+        cwd: '/repo',
+        command: 'agent',
+        args: [],
+        promptIdleTimeoutMs: 10_000,
+        cancelGraceTimeoutMs: 120,
+        transportFactory: () => transport,
+      })
+      await client.startOrResume()
+
+      const controller = new AbortController()
+      const turnPromise = client.runTurn([{ type: 'text', text: 'unstoppable task' }], {}, controller.signal)
+      const expectation = expect(turnPromise).rejects.toThrow(/cancel timed out after 120ms/)
+
+      controller.abort('user_stop')
+      expect(transport.sent).toContainEqual({
+        jsonrpc: '2.0',
+        method: 'session/cancel',
+        params: { sessionId: 'acp_cancel_hang' },
+      })
+
+      // Peer ignores session/cancel and keeps pushing session/update chunks every 40ms;
+      // these updates MUST NOT reset or extend the cancel grace deadline.
+      for (let i = 0; i < 4; i += 1) {
+        await vi.advanceTimersByTimeAsync(40)
+        transport.emit({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: 'acp_cancel_hang',
+            update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'still running' } },
+          },
+        })
+      }
+
+      await expectation
+      await client.close()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('cancels stray session/request_permission arriving when no turn is active instead of auto-approving', async () => {
+    const transport = new MockAcpTransport((msg, t) => {
+      if (msg.method === 'initialize') {
+        t.emit({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1 } })
+      } else if (msg.method === 'session/new') {
+        t.emit({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 'acp_stray_perm' } })
+      }
+    })
+
+    const client = new AcpRuntimeClient({
+      cwd: '/repo',
+      command: 'agent',
+      args: [],
+      transportFactory: () => transport,
+    })
+    await client.startOrResume()
+
+    // Emit a late permission request while activeTurn is undefined
+    transport.emit({
+      jsonrpc: '2.0',
+      id: 777,
+      method: 'session/request_permission',
+      params: {
+        sessionId: 'acp_stray_perm',
+        toolCall: { toolCallId: 'tc_late', name: 'bash', title: 'Dangerous command' },
+        options: [
+          { optionId: 'allow_always', name: 'Allow Always', kind: 'allow_always' },
+          { optionId: 'reject_once', name: 'Reject', kind: 'reject_once' },
+        ],
+      },
+    })
+
+    await Promise.resolve()
+    expect(transport.sent).toContainEqual({
+      jsonrpc: '2.0',
+      id: 777,
+      result: { outcome: { outcome: 'cancelled' } },
+    })
+    await client.close()
+  })
+
+  it('handles asynchronous child.stdin EPIPE errors on AcpStdioTransport without crashing the host process', async () => {
+    const { AcpStdioTransport } = await import('../src/stdio-transport.js')
+    const uncaught: Error[] = []
+    const onUncaught = (err: Error) => {
+      uncaught.push(err)
+    }
+    process.on('uncaughtException', onUncaught)
+
+    const transport = new AcpStdioTransport({
+      command: process.execPath,
+      args: ['-e', 'process.exit(0)'],
+      cwd: process.cwd(),
+      env: process.env,
+    })
+
+    const closedPromise = new Promise<Error | undefined>((resolve) => {
+      transport.onClose((err) => resolve(err))
+    })
+
+    try {
+      const largePayload = 'x'.repeat(256 * 1024)
+      for (let i = 0; i < 6; i += 1) {
+        try {
+          transport.send({ jsonrpc: '2.0', id: i + 1, method: 'session/prompt', params: { blob: largePayload } })
+        } catch {
+          break
+        }
+        await new Promise((r) => setTimeout(r, 10))
+      }
+      await closedPromise
+      await new Promise((r) => setTimeout(r, 30))
+      expect(uncaught).toEqual([])
+    } finally {
+      process.off('uncaughtException', onUncaught)
+      await transport.close()
+    }
+  })
 })

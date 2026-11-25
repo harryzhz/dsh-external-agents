@@ -1,4 +1,8 @@
-export { AcpRuntimeClient, DEFAULT_PROMPT_IDLE_TIMEOUT_MS } from './client.js'
+export {
+  AcpRuntimeClient,
+  DEFAULT_CANCEL_GRACE_TIMEOUT_MS,
+  DEFAULT_PROMPT_IDLE_TIMEOUT_MS,
+} from './client.js'
 export {
   ACP_AUTH_REQUIRED,
   ACP_RESOURCE_NOT_FOUND,

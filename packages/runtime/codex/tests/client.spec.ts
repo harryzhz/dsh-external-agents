@@ -641,4 +641,42 @@ describe('CodexRuntimeClient', () => {
       toolName: 'apply_patch',
     })
   })
+
+  it('handles asynchronous child.stdin EPIPE errors on CodexStdioTransport without crashing the host process', async () => {
+    const { CodexStdioTransport } = await import('../src/stdio-transport.js')
+    const uncaught: Error[] = []
+    const onUncaught = (err: Error) => {
+      uncaught.push(err)
+    }
+    process.on('uncaughtException', onUncaught)
+
+    const transport = new CodexStdioTransport({
+      cliBin: process.execPath,
+      args: ['-e', 'process.exit(0)'],
+      cwd: process.cwd(),
+      env: process.env,
+    })
+
+    const closedPromise = new Promise<Error | undefined>((resolve) => {
+      transport.onClose((err) => resolve(err))
+    })
+
+    try {
+      const largePayload = 'x'.repeat(256 * 1024)
+      for (let i = 0; i < 6; i += 1) {
+        try {
+          transport.send({ jsonrpc: '2.0', id: i + 1, method: 'turn/start', params: { blob: largePayload } })
+        } catch {
+          break
+        }
+        await new Promise((r) => setTimeout(r, 10))
+      }
+      await closedPromise
+      await new Promise((r) => setTimeout(r, 30))
+      expect(uncaught).toEqual([])
+    } finally {
+      process.off('uncaughtException', onUncaught)
+      await transport.close()
+    }
+  })
 })

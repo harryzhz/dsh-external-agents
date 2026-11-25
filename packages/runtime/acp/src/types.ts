@@ -186,6 +186,12 @@ export interface AcpRuntimeOptions {
    * or permission activity arrives. Defaults to 30 minutes; set `0` to disable.
    */
   readonly promptIdleTimeoutMs?: number
+  /**
+   * Grace timeout (ms) after sending `session/cancel` for an externally aborted turn.
+   * Prevents teardown/stop deadlocks if the peer ignores cancel or keeps streaming.
+   * Defaults to 5 seconds; set `0` to wait indefinitely.
+   */
+  readonly cancelGraceTimeoutMs?: number
   readonly clientName?: string
   readonly clientVersion?: string
   readonly logger?: (message: string) => void

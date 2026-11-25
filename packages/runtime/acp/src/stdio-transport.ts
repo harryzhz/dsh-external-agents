@@ -47,6 +47,16 @@ export class AcpStdioTransport implements AcpJsonRpcTransport {
       throw new Error(`${this.label} stdio pipes unavailable`)
     }
 
+    this.child.stdin.on('error', (err: NodeJS.ErrnoException) => {
+      if (this.closed) return
+      const code = err.code
+      if (code === 'EPIPE' || code === 'ERR_STREAM_DESTROYED') {
+        this.notifyClosed(new Error(`${this.label} stdin pipe closed (${code}): ${err.message}`))
+        return
+      }
+      this.notifyClosed(new Error(`${this.label} stdin error: ${err.message}`))
+    })
+
     this.rl = createInterface({ input: this.child.stdout })
     this.rl.on('line', (line) => this.handleLine(line))
 
