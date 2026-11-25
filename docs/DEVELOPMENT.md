@@ -33,27 +33,26 @@
 4. **向 `main` 发起 Pull Request 并执行端到端真实验证**：
    - 使用 `gh pr create --base main` 或在 GitHub 页面创建 PR，简要说明变更动机、核心改动与本地验证结果。
    - 确保 CI（`check:privacy`、`build`、`typecheck`、`test`、`pack`）全部通过，并按第 2 节完成真实环境端到端验证（纯文档变更除外）。
-5. **验证通过后自动合入 `main`、同步构建、清理 Worktree 并优雅重启服务**：
-   - 当门禁、GitHub CI 与端到端真实验证全部通过后，无需等待二次确认，直接自动合入 `main` 并清理工作树：
+5. **验证通过后合入 `main` 并清理 Worktree（不直接替换正式服务）**：
+   - 当门禁、GitHub CI 与端到端真实验证全部通过后，直接合入 `main` 并清理工作树：
    ```bash
    gh pr merge <pr-number> --squash --delete-branch
    cd <主仓库根目录>
    git fetch origin && git checkout main && git pull --ff-only origin main
-   pnpm build
    git worktree remove .worktrees/<slug>
    git branch -d feat/<slug> 2>/dev/null || true
    git worktree prune
    ```
-   - 涉及运行时代码变更时，将主干构建产物同步至本地 DSH 运行环境并执行优雅排空重启与健康自检（纯文档变更无需重启）。
+   - 日常迭代合入后**不再直接替换或重启正式本地 DSH Web 服务**；正式环境统一通过 GitHub Release `.tgz` 安装，待发版后于凌晨低峰或按负责人明确要求执行免重启热更新。
 
-## 2. 端到端真实验证与自动合入重启
+## 2. 端到端真实验证与发布更新规范
 
-除纯文档变更外，所有 PR 合入 `main` 前须完成真实环境端到端验证，通过后自动完成合入与重启闭环：
+除纯文档变更外，所有 PR 合入 `main` 前须完成真实环境端到端验证，通过后合入 `main`：
 
-- **优先使用独立隔离的本地 E2E 实例**：推荐在本机维护与正式实例隔离的独立 E2E DSH Web 环境（独立 `DSH_HOME`、独立监听端口、独立测试机器人与专用测试群），直接挂载当前 PR worktree 的构建产物完成真实浏览器与飞书端到端实测，全程零干扰正式服务；多个并行 worktree 同时进入验收或合入主干阶段时，通过本机互斥租约锁排队串行占用 E2E 实例与主干构建重启流程，避免相互抢占与覆盖。
+- **优先使用独立隔离的本地 E2E 实例**：推荐在本机维护与正式实例隔离的独立 E2E DSH Web 环境（独立 `DSH_HOME`、独立监听端口、独立测试机器人与专用测试群），直接挂载当前 PR worktree 的构建产物完成真实浏览器与飞书端到端实测，全程零干扰正式服务；多个并行 worktree 同时进入验收阶段时，通过本机互斥租约锁排队串行占用 E2E 实例，避免相互抢占与覆盖。
 - **飞书端到端实测**：已配置独立 E2E 环境时，在专用测试群通过双机器人（或用户态驱动）向挂载 PR 产物的测试机器人发消息并核验完整入站、运行时调度与回复闭环；未配置独立 E2E 环境时，若任务由飞书端发起则默认在当前触发任务所在的飞书群/话题实测，或使用用户显式提供的验收群。**严禁将任何真实群名称、群 ID、消息 ID、测试机器人 ID 或宿主机路径写入文档、代码、测试夹具或 PR 描述**；非飞书发起且未配置 E2E/验收群时须先向用户确认，严禁向非测试业务群发消息。
 - **真实浏览器验证**：使用真实浏览器（如无头 Chrome / CDP / Playwright）访问挂载当前 PR 产物的本地 DSH Web，核验外部运行时预设展示、会话交互/轨迹渲染正常，且无 `pageerror`、`console.error` 或接口 4xx/5xx 报错。
-- **优雅排空重启**：合入 `main` 并重新执行 `pnpm build`（若正式 profile 以 `file:` 挂载，同步更新对应运行期 `dist/`）后，先执行 `lark-bridge lifecycle drain --wait --reason "<reason>"`（飞书会话内发起时通过 `.local/` 下的脱离进程组脚本在当前回复送达后使用 `--allow-in-session` 执行，避免中断当前回合），排空后重启正式本地 DSH 托管服务并运行 `lark-bridge doctor` 验证。任一验证或排空异常均须立即中止自动合入或重启并回报失败原因。
+- **正式环境发布与免重启热更新**：正式 DSH Web 统一通过 GitHub Release `.tgz` 安装 `@harryzhz/dsh-external-agents`（启用 DSH 原生 HMR）；发布新版本（推送 `vX.Y.Z` tag）后，在凌晨低峰自动检查或按需通过「飞书桥接」插件 UI 或 `lark-bridge plugin update external-agents`（会话内加 `--detached`）完成免重启热更新，不干扰日常迭代期间的正式服务稳定性。
 
 ## 3. 常用命令与目录约定
 
