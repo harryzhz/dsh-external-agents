@@ -52,7 +52,7 @@
 - **优先使用独立隔离的本地 E2E 实例**：推荐在本机维护与正式实例隔离的独立 E2E DSH Web 环境（独立 `DSH_HOME`、独立监听端口、独立测试机器人与专用测试群），直接挂载当前 PR worktree 的构建产物完成真实浏览器与飞书端到端实测，全程零干扰正式服务；多个并行 worktree 同时进入验收阶段时，通过本机互斥租约锁排队串行占用 E2E 实例，避免相互抢占与覆盖。
 - **飞书端到端实测**：已配置独立 E2E 环境时，在专用测试群通过双机器人（或用户态驱动）向挂载 PR 产物的测试机器人发消息并核验完整入站、运行时调度与回复闭环；未配置独立 E2E 环境时，若任务由飞书端发起则默认在当前触发任务所在的飞书群/话题实测，或使用用户显式提供的验收群。**严禁将任何真实群名称、群 ID、消息 ID、测试机器人 ID 或宿主机路径写入文档、代码、测试夹具或 PR 描述**；非飞书发起且未配置 E2E/验收群时须先向用户确认，严禁向非测试业务群发消息。
 - **真实浏览器验证**：使用真实浏览器（如无头 Chrome / CDP / Playwright）访问挂载当前 PR 产物的本地 DSH Web，核验外部运行时预设展示、会话交互/轨迹渲染正常，且无 `pageerror`、`console.error` 或接口 4xx/5xx 报错。
-- **正式环境发布与免重启热更新**：正式 DSH Web 统一通过 GitHub Release `.tgz` 安装 `@harryzhz/dsh-external-agents`（启用 DSH 原生 HMR）；发布新版本（推送 `vX.Y.Z` tag）后，在凌晨低峰自动检查或按需通过「飞书桥接」插件 UI 或 `lark-bridge plugin update external-agents`（会话内加 `--detached`）完成免重启热更新，不干扰日常迭代期间的正式服务稳定性。
+- **正式环境发布与免重启热更新**：正式 DSH Web 统一通过 GitHub Release `.tgz` 安装 `@harryzhz/dsh-external-agents`（启用 DSH 原生 HMR）；包含代码/产物变更的 PR 合入 `main` 后，`Release Plugin` workflow 会自动递增版本号（默认 patch；提交信息含 `[minor]` / `[major]` 时对应递增）、验证打包、推送 `vX.Y.Z` tag 并发布 GitHub Release（纯文档/CI/单测改动自动跳过，亦可手动 `workflow_dispatch` 或推送 `v*` tag 触发）；随后在凌晨低峰自动检查或按需通过「飞书桥接」插件 UI 或 `lark-bridge plugin update external-agents`（会话内加 `--detached`）完成免重启热更新，不干扰日常迭代期间的正式服务稳定性。
 
 ## 3. 常用命令与目录约定
 
