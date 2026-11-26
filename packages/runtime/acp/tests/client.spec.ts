@@ -1849,4 +1849,146 @@ describe('AcpRuntimeClient prompt idle timeout', () => {
     await handleB.close()
     await client.close()
   })
+
+  it('emits mid-turn usage_update as context-usage without polluting billable usage when session/prompt returns authoritative usage', async () => {
+    const transport = new MockAcpTransport((msg, t) => {
+      if (msg.method === 'initialize') {
+        t.emit({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1 } })
+      } else if (msg.method === 'session/new') {
+        t.emit({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 'acp_usage_1' } })
+      } else if (msg.method === 'session/prompt') {
+        queueMicrotask(() => {
+          t.emit({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'acp_usage_1',
+              update: { sessionUpdate: 'usage_update', used: 23_429, size: 1_048_576 },
+            },
+          })
+          t.emit({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'acp_usage_1',
+              update: { sessionUpdate: 'usage_update', used: 68_199, size: 1_048_576 },
+            },
+          })
+          t.emit({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'acp_usage_1',
+              update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Done' } },
+            },
+          })
+          t.emit({
+            jsonrpc: '2.0',
+            id: msg.id,
+            result: {
+              stopReason: 'end_turn',
+              usage: {
+                inputTokens: 199_015,
+                outputTokens: 22_416,
+                cachedReadTokens: 1_153_637,
+                totalTokens: 1_375_068,
+              },
+            },
+          })
+        })
+      }
+    })
+
+    const client = new AcpRuntimeClient({
+      cwd: '/repo',
+      command: 'agy',
+      args: [],
+      transportFactory: () => transport,
+    })
+    await client.startOrResume()
+
+    const events: AcpTurnEvent[] = []
+    const res = await client.runTurn([{ type: 'text', text: 'analyze' }], {
+      onEvent: (ev) => events.push(ev),
+    })
+
+    expect(events.filter((e) => e.type === 'context-usage')).toEqual([
+      { type: 'context-usage', used: 23_429, size: 1_048_576 },
+      { type: 'context-usage', used: 68_199, size: 1_048_576 },
+    ])
+    const usageEvents = events.filter((e) => e.type === 'usage')
+    expect(usageEvents).toHaveLength(1)
+    expect(res.usage).toEqual({
+      inputTokens: 199_015,
+      outputTokens: 22_416,
+      cacheReadTokens: 1_153_637,
+      totalTokens: 1_375_068,
+    })
+    await client.close()
+  })
+
+  it('falls back to a single final usage from the latest usage_update only when session/prompt omits usage', async () => {
+    const transport = new MockAcpTransport((msg, t) => {
+      if (msg.method === 'initialize') {
+        t.emit({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1 } })
+      } else if (msg.method === 'session/new') {
+        t.emit({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 'acp_usage_fallback' } })
+      } else if (msg.method === 'session/prompt') {
+        queueMicrotask(() => {
+          t.emit({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'acp_usage_fallback',
+              update: { sessionUpdate: 'usage_update', used: 10_000, size: 200_000 },
+            },
+          })
+          t.emit({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'acp_usage_fallback',
+              update: { sessionUpdate: 'usage_update', used: 15_000, size: 200_000 },
+            },
+          })
+          t.emit({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'acp_usage_fallback',
+              update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'OK' } },
+            },
+          })
+          t.emit({
+            jsonrpc: '2.0',
+            id: msg.id,
+            result: { stopReason: 'end_turn' },
+          })
+        })
+      }
+    })
+
+    const client = new AcpRuntimeClient({
+      cwd: '/repo',
+      command: 'agy',
+      args: [],
+      transportFactory: () => transport,
+    })
+    await client.startOrResume()
+
+    const events: AcpTurnEvent[] = []
+    const res = await client.runTurn([{ type: 'text', text: 'hello' }], {
+      onEvent: (ev) => events.push(ev),
+    })
+
+    const usageEvents = events.filter((e) => e.type === 'usage')
+    expect(usageEvents).toHaveLength(1)
+    expect(res.usage).toEqual({
+      inputTokens: 15_000,
+      outputTokens: 0,
+      contextUsed: 15_000,
+      contextSize: 200_000,
+    })
+    await client.close()
+  })
 })

@@ -340,15 +340,13 @@ export function normalizeAcpSessionUpdate(
     const used = asNumber(update.used)
     const size = asNumber(update.size)
     if (used === undefined) return []
-    return [{
-      type: 'usage',
-      usage: {
-        inputTokens: used,
-        outputTokens: 0,
-        contextUsed: used,
-        ...(size !== undefined ? { contextSize: size } : {}),
+    return [
+      {
+        type: 'context-usage',
+        used,
+        ...(size !== undefined ? { size } : {}),
       },
-    }]
+    ]
   }
 
   if (kind === 'session_info_update') {

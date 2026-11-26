@@ -50,6 +50,36 @@ export interface StepRecorderOptions {
 }
 
 /**
+ * DSH `TokenUsage` counts are strictly disjoint (`inputTokens` = uncached input only;
+ * billed prompt = `inputTokens + cacheReadTokens + cacheWriteTokens`). Providers whose
+ * wire payloads fold cache tokens into `inputTokens` (such that `inputTokens + outputTokens
+ * === totalTokens` while cache counts are non-zero) are normalized by subtracting cached
+ * prompt tokens out of `inputTokens` so totals are never double-counted.
+ */
+function normalizeDisjointTokenUsage(usage: TokenUsage): TokenUsage {
+  const input = Math.max(0, usage.inputTokens)
+  const output = Math.max(0, usage.outputTokens)
+  const cacheRead = Math.max(0, usage.cacheReadTokens ?? 0)
+  const cacheWrite = Math.max(0, usage.cacheWriteTokens ?? 0)
+  const cached = cacheRead + cacheWrite
+  const total = usage.totalTokens
+  if (
+    cached > 0 &&
+    typeof total === 'number' &&
+    Number.isFinite(total) &&
+    input >= cached &&
+    input + output === total &&
+    input + cached + output > total
+  ) {
+    return {
+      ...usage,
+      inputTokens: input - cached,
+    }
+  }
+  return usage
+}
+
+/**
  * Translates an external agent's event stream into a strictly valid DSH v4
  * step/assistant/tool event sequence so persisted logs always pass cold-resume
  * relationship validation.
@@ -59,6 +89,7 @@ export class ExternalStepRecorder {
   private stepOpen = false
   private attempt?: ActiveAttempt
   private latestUsage?: TokenUsage
+  private pendingUsage?: TokenUsage
   private readonly openTools = new Map<string, PendingTool>()
 
   constructor(private readonly opts: StepRecorderOptions) {}
@@ -81,7 +112,12 @@ export class ExternalStepRecorder {
 
   handleEvent(event: ExternalTurnEvent): void {
     if (event.type === 'usage') {
-      this.latestUsage = event.usage
+      const normalized = normalizeDisjointTokenUsage(event.usage)
+      this.latestUsage = normalized
+      this.pendingUsage = normalized
+      return
+    }
+    if (event.type === 'context-usage') {
       return
     }
     if (event.type === 'title') {
@@ -333,16 +369,12 @@ export class ExternalStepRecorder {
     this.attempt = undefined
 
     this.closeOpenTextualBlock(attempt)
-    if (this.latestUsage) {
-      this.pushChunk(attempt, { type: 'usage', usage: this.latestUsage })
-    }
-    this.pushChunk(attempt, {
-      type: 'finish',
-      reason: finishReason === 'tool-calls' ? { kind: 'tool-calls' } : { kind: 'stop' },
-    })
-
     const blocks = attempt.assembler.blocks()
     if (blocks.length === 0) {
+      this.pushChunk(attempt, {
+        type: 'finish',
+        reason: finishReason === 'tool-calls' ? { kind: 'tool-calls' } : { kind: 'stop' },
+      })
       this.opts.emitter.emitStream({
         type: 'end',
         attemptId: attempt.attemptId,
@@ -352,6 +384,16 @@ export class ExternalStepRecorder {
       })
       return
     }
+
+    const usage = this.pendingUsage
+    this.pendingUsage = undefined
+    if (usage) {
+      this.pushChunk(attempt, { type: 'usage', usage })
+    }
+    this.pushChunk(attempt, {
+      type: 'finish',
+      reason: finishReason === 'tool-calls' ? { kind: 'tool-calls' } : { kind: 'stop' },
+    })
 
     const message = createAssistantMessage({
       content: blocks,
@@ -366,7 +408,7 @@ export class ExternalStepRecorder {
         turn: this.opts.turn,
         step: this.step,
         message,
-        ...(this.latestUsage ? { usage: this.latestUsage } : {}),
+        ...(usage ? { usage } : {}),
         ...(interrupted ? { interrupted: true } : {}),
         stream: [...attempt.accumulator.snapshot()],
       },

@@ -57,6 +57,7 @@ interface ActiveTurnContext {
   readonly startedAtMs: number
   text: string
   usage?: AcpTokenUsage
+  lastContextUsage?: { readonly used: number; readonly size?: number }
   cancelPending: boolean
   updateCount: number
   lastUpdateKind?: string
@@ -541,7 +542,19 @@ export class AcpRuntimeClient {
         stopReason?: string
         usage?: unknown
       }
-      const usage = extractAcpPromptUsage(res?.usage) ?? turn.usage
+      const promptUsage = extractAcpPromptUsage(res?.usage)
+      const fallbackUsage: AcpTokenUsage | undefined =
+        !promptUsage && !turn.usage && turn.lastContextUsage
+          ? {
+              inputTokens: turn.lastContextUsage.used,
+              outputTokens: 0,
+              contextUsed: turn.lastContextUsage.used,
+              ...(turn.lastContextUsage.size !== undefined
+                ? { contextSize: turn.lastContextUsage.size }
+                : {}),
+            }
+          : undefined
+      const usage = promptUsage ?? turn.usage ?? fallbackUsage
       if (usage) {
         try {
           handlers.onEvent?.({ type: 'usage', usage })
@@ -959,6 +972,11 @@ export class AcpRuntimeClient {
         turn.text += event.text
       } else if (event.type === 'usage') {
         turn.usage = event.usage
+      } else if (event.type === 'context-usage') {
+        turn.lastContextUsage = {
+          used: event.used,
+          ...(event.size !== undefined ? { size: event.size } : {}),
+        }
       }
       try {
         turn.handlers.onEvent?.(event)

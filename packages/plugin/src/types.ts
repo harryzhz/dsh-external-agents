@@ -196,6 +196,7 @@ export type ExternalTurnEvent =
       readonly meta?: Record<string, unknown>
     }
   | { readonly type: 'usage'; readonly usage: TokenUsage }
+  | { readonly type: 'context-usage'; readonly used: number; readonly size?: number }
   | { readonly type: 'title'; readonly title: string }
 
 export interface ExternalTurnRunResult {

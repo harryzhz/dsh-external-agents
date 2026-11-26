@@ -252,4 +252,108 @@ describe('ExternalStepRecorder', () => {
     const msg = assistantEvent.data.message as { content: Array<{ type: string; text: string }> }
     expect(msg.content).toEqual([{ type: 'text', text: expectedText }])
   })
+
+  it('consumes pending usage at most once across parallel tool calls and ignores context-usage snapshots', () => {
+    const { session, events } = createFakeSession()
+    let attemptSeq = 0
+    let rev = 0
+
+    const recorder = new ExternalStepRecorder({
+      agentId: 'a6',
+      session,
+      emitter: { emitStream: () => {} },
+      turn: 1,
+      provider: 'agy-cli',
+      model: 'gemini-4-neon',
+      nextAttemptId: () => brandString<LlmAttemptId>(`att_${++attemptSeq}`),
+      nextFrameRevision: () => ++rev,
+    })
+
+    recorder.startInitialStep()
+    // Mid-turn ACP usage_update snapshots must never be persisted as billable step usage
+    recorder.handleEvent({ type: 'context-usage', used: 350_000, size: 1_048_576 })
+    recorder.handleEvent({ type: 'reasoning-delta', text: 'Inspect files' })
+    recorder.handleEvent({ type: 'tool-start', callId: 'c1', name: 'read', arguments: '{}' })
+    recorder.handleEvent({ type: 'tool-start', callId: 'c2', name: 'read', arguments: '{}' })
+    recorder.handleEvent({ type: 'tool-complete', callId: 'c1', name: 'read', output: 'a', isError: false })
+    recorder.handleEvent({ type: 'tool-complete', callId: 'c2', name: 'read', output: 'b', isError: false })
+    recorder.handleEvent({ type: 'context-usage', used: 390_000, size: 1_048_576 })
+    // Authoritative turn-end usage (already disjoint: 199_015 + 1_153_637 + 22_416 = 1_375_068)
+    recorder.handleEvent({ type: 'text-delta', text: 'All done.' })
+    recorder.handleEvent({
+      type: 'usage',
+      usage: {
+        inputTokens: 199_015,
+        outputTokens: 22_416,
+        cacheReadTokens: 1_153_637,
+        cacheWriteTokens: 0,
+        totalTokens: 1_375_068,
+      },
+    })
+    recorder.finish(false)
+
+    const assistantMsgs = events.filter((e) => e.type === 'assistant/message')
+    expect(assistantMsgs).toHaveLength(3)
+    expect(assistantMsgs[0]!.data.usage).toBeUndefined()
+    expect(assistantMsgs[1]!.data.usage).toBeUndefined()
+    expect(assistantMsgs[2]!.data.usage).toEqual({
+      inputTokens: 199_015,
+      outputTokens: 22_416,
+      cacheReadTokens: 1_153_637,
+      cacheWriteTokens: 0,
+      totalTokens: 1_375_068,
+    })
+  })
+
+  it('normalizes inclusive provider usage to disjoint uncached inputTokens and never repeats usage across subsequent tool commits', () => {
+    const { session, events } = createFakeSession()
+    let attemptSeq = 0
+    let rev = 0
+
+    const recorder = new ExternalStepRecorder({
+      agentId: 'a7',
+      session,
+      emitter: { emitStream: () => {} },
+      turn: 1,
+      provider: 'codex-cli',
+      model: 'gpt-6.1-sol',
+      nextAttemptId: () => brandString<LlmAttemptId>(`att_${++attemptSeq}`),
+      nextFrameRevision: () => ++rev,
+    })
+
+    recorder.startInitialStep()
+    // Codex reports inputTokens inclusive of cacheRead + cacheWrite (37_642 + 233 === 37_875)
+    recorder.handleEvent({
+      type: 'usage',
+      usage: {
+        inputTokens: 37_642,
+        outputTokens: 233,
+        cacheReadTokens: 25_574,
+        cacheWriteTokens: 12_065,
+        totalTokens: 37_875,
+      },
+    })
+    recorder.handleEvent({ type: 'tool-start', callId: 't1', name: 'bash', arguments: '{}' })
+    recorder.handleEvent({ type: 'tool-start', callId: 't2', name: 'bash', arguments: '{}' })
+    recorder.handleEvent({ type: 'tool-start', callId: 't3', name: 'bash', arguments: '{}' })
+    recorder.handleEvent({ type: 'tool-complete', callId: 't1', name: 'bash', output: '1', isError: false })
+    recorder.handleEvent({ type: 'tool-complete', callId: 't2', name: 'bash', output: '2', isError: false })
+    recorder.handleEvent({ type: 'tool-complete', callId: 't3', name: 'bash', output: '3', isError: false })
+    recorder.handleEvent({ type: 'text-delta', text: 'Finished.' })
+    recorder.finish(false)
+
+    const assistantMsgs = events.filter((e) => e.type === 'assistant/message')
+    expect(assistantMsgs).toHaveLength(4)
+    // Only the first commit consumes the usage, with inputTokens normalized to uncached (37_642 - 37_639 = 3)
+    expect(assistantMsgs[0]!.data.usage).toEqual({
+      inputTokens: 3,
+      outputTokens: 233,
+      cacheReadTokens: 25_574,
+      cacheWriteTokens: 12_065,
+      totalTokens: 37_875,
+    })
+    expect(assistantMsgs[1]!.data.usage).toBeUndefined()
+    expect(assistantMsgs[2]!.data.usage).toBeUndefined()
+    expect(assistantMsgs[3]!.data.usage).toBeUndefined()
+  })
 })
