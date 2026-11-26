@@ -40,7 +40,7 @@ import {
   type AcpPoolClientLike,
 } from '../src/runtime/acp-pool.js'
 import { createAcpRuntime } from '../src/runtime/acp-runtime.js'
-import { resolveRuntimeSpecs } from '../src/runtime/config.js'
+import { buildRuntimeEnv, resolveRuntimeSpecs } from '../src/runtime/config.js'
 import { createExternalRuntimeRegistry } from '../src/runtime/registry.js'
 import type { ExternalRuntimeProfile } from '../src/types.js'
 
@@ -433,5 +433,37 @@ describe('AcpRuntimePool isolation, multiplexing, probe reuse, and lifecycle', (
     expect(createdClients).toHaveLength(3)
     await s3.release()
     await pool.disposeAll()
+  })
+
+  it('strips inherited host session identity env vars in buildRuntimeEnv while allowing explicit extraEnv', () => {
+    const prevDshSid = process.env.DSH_SESSION_ID
+    const prevInAgent = process.env.DSH_IN_AGENT_SESSION
+    const prevAgyConv = process.env.ANTIGRAVITY_CONVERSATION_ID
+    const prevAgyTraj = process.env.ANTIGRAVITY_TRAJECTORY_ID
+    process.env.DSH_SESSION_ID = 'session-ambient-host'
+    process.env.DSH_IN_AGENT_SESSION = '1'
+    process.env.ANTIGRAVITY_CONVERSATION_ID = 'ext-ambient-conv'
+    process.env.ANTIGRAVITY_TRAJECTORY_ID = 'traj-ambient-1'
+    try {
+      const codexSpec = resolveRuntimeSpecs([]).find((s) => s.id === 'codex')!
+      const cleanProbeEnv = buildRuntimeEnv(codexSpec)
+      expect(cleanProbeEnv.DSH_SESSION_ID).toBeUndefined()
+      expect(cleanProbeEnv.DSH_IN_AGENT_SESSION).toBeUndefined()
+      expect(cleanProbeEnv.ANTIGRAVITY_CONVERSATION_ID).toBeUndefined()
+      expect(cleanProbeEnv.ANTIGRAVITY_TRAJECTORY_ID).toBeUndefined()
+
+      const boundSessionEnv = buildRuntimeEnv(codexSpec, { DSH_SESSION_ID: 'session-child-1' })
+      expect(boundSessionEnv.DSH_SESSION_ID).toBe('session-child-1')
+      expect(boundSessionEnv.ANTIGRAVITY_CONVERSATION_ID).toBeUndefined()
+    } finally {
+      if (prevDshSid === undefined) delete process.env.DSH_SESSION_ID
+      else process.env.DSH_SESSION_ID = prevDshSid
+      if (prevInAgent === undefined) delete process.env.DSH_IN_AGENT_SESSION
+      else process.env.DSH_IN_AGENT_SESSION = prevInAgent
+      if (prevAgyConv === undefined) delete process.env.ANTIGRAVITY_CONVERSATION_ID
+      else process.env.ANTIGRAVITY_CONVERSATION_ID = prevAgyConv
+      if (prevAgyTraj === undefined) delete process.env.ANTIGRAVITY_TRAJECTORY_ID
+      else process.env.ANTIGRAVITY_TRAJECTORY_ID = prevAgyTraj
+    }
   })
 })

@@ -71,6 +71,28 @@ interface ActiveTurnState {
   readonly fail: (error: Error) => void
 }
 
+function extractCodexNotificationThreadId(params: unknown): string | undefined {
+  if (!params || typeof params !== 'object') return undefined
+  const rec = params as Record<string, unknown>
+  const direct =
+    typeof rec.threadId === 'string'
+      ? rec.threadId
+      : typeof rec.thread_id === 'string'
+        ? rec.thread_id
+        : undefined
+  if (direct?.trim()) return direct.trim()
+  const turn =
+    rec.turn && typeof rec.turn === 'object' ? (rec.turn as Record<string, unknown>) : undefined
+  if (typeof turn?.threadId === 'string' && turn.threadId.trim()) return turn.threadId.trim()
+  if (typeof turn?.thread_id === 'string' && turn.thread_id.trim()) return turn.thread_id.trim()
+  const thread =
+    rec.thread && typeof rec.thread === 'object'
+      ? (rec.thread as Record<string, unknown>)
+      : undefined
+  if (typeof thread?.id === 'string' && thread.id.trim()) return thread.id.trim()
+  return undefined
+}
+
 function sandboxPolicyForTurn(sandbox?: CodexSandboxMode): Record<string, unknown> | undefined {
   if (sandbox === 'danger-full-access') return { type: 'dangerFullAccess' }
   if (sandbox === 'workspace-write') return { type: 'workspaceWrite' }
@@ -532,6 +554,21 @@ export class CodexRuntimeClient {
     method: string,
     params: unknown,
   ): Promise<void> {
+    const incomingThreadId = extractCodexNotificationThreadId(params)
+    if (incomingThreadId && this.currentThreadId && incomingThreadId !== this.currentThreadId) {
+      this.logger(
+        `${this.label} declining server request "${method}" for foreign thread ${incomingThreadId} (current=${this.currentThreadId})`,
+      )
+      if (method === 'item/tool/requestUserInput') {
+        this.respond(id, { answers: {} })
+      } else if (method === 'mcpServer/elicitation/request') {
+        this.respond(id, { action: 'cancel', content: null, _meta: null })
+      } else {
+        this.respond(id, mapApprovalResponse(method, 'reject'))
+      }
+      return
+    }
+
     const turn = this.activeTurn
     const signal = turn?.abortController.signal ?? new AbortController().signal
 
@@ -581,6 +618,14 @@ export class CodexRuntimeClient {
   private handleNotification(method: string, params: unknown): void {
     const turn = this.activeTurn
     if (!turn) return
+
+    const incomingThreadId = extractCodexNotificationThreadId(params)
+    if (incomingThreadId && this.currentThreadId && incomingThreadId !== this.currentThreadId) {
+      this.logger(
+        `${this.label} ignoring notification "${method}" for foreign thread ${incomingThreadId} (current=${this.currentThreadId})`,
+      )
+      return
+    }
 
     const events = normalizeCodexNotification(method, params)
     for (const event of events) {

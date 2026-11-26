@@ -248,7 +248,14 @@ export function resolveRuntimeSpecs(overrides: readonly ExternalRuntimeOverride[
   return [...resolved.values()]
 }
 
-/** Child environment for a runtime process: host env + bridge CLI PATH + configured env, optionally SSH-stripped. */
+const INHERITED_SESSION_ENV_KEYS = [
+  'DSH_SESSION_ID',
+  'DSH_IN_AGENT_SESSION',
+  'ANTIGRAVITY_CONVERSATION_ID',
+  'ANTIGRAVITY_TRAJECTORY_ID',
+] as const
+
+/** Child environment for a runtime process: host env (stripped of inherited session IDs) + bridge CLI PATH + configured env, optionally SSH-stripped. */
 export function buildRuntimeEnv(
   spec: ExternalRuntimeConfig,
   extraEnv?: Readonly<Record<string, string>>,
@@ -261,8 +268,15 @@ export function buildRuntimeEnv(
   const pathParts = [bridgeBinDir, userLocalBinDir, traeBinDir, ...currentPath.split(delimiter).filter(Boolean)]
   const dedupedPath = [...new Set(pathParts)].join(delimiter)
 
+  // Never propagate ambient parent/host session IDs into newly spawned external
+  // CLI processes; each runtime injects its own canonical session context via extraEnv.
+  const sanitizedHostEnv: NodeJS.ProcessEnv = { ...process.env }
+  for (const key of INHERITED_SESSION_ENV_KEYS) {
+    delete sanitizedHostEnv[key]
+  }
+
   const merged: NodeJS.ProcessEnv = {
-    ...process.env,
+    ...sanitizedHostEnv,
     PATH: dedupedPath,
     ...spec.env,
     ...(extraEnv ?? {}),

@@ -1690,4 +1690,77 @@ describe('AcpRuntimeClient prompt idle timeout', () => {
       vi.useRealTimers()
     }
   })
+
+  it('fails closed on unlabelled session/update and permission requests when multiple sessions are open', async () => {
+    let seq = 0
+    const promptIds = new Map<string, number | string>()
+    const permissionReplies: Array<{ id: number | string; result: unknown }> = []
+    const transport = new MockAcpTransport((msg, t) => {
+      if (msg.method === 'initialize') {
+        t.emit({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1 } })
+      } else if (msg.method === 'session/new') {
+        seq += 1
+        t.emit({ jsonrpc: '2.0', id: msg.id, result: { sessionId: `acp_mux_guard_${seq}` } })
+      } else if (msg.method === 'session/prompt') {
+        const sid = (msg.params as { sessionId: string }).sessionId
+        promptIds.set(sid, msg.id!)
+      } else if (msg.id === 777) {
+        permissionReplies.push({ id: msg.id, result: msg.result })
+      }
+    })
+
+    const client = new AcpRuntimeClient({
+      cwd: '/repo',
+      command: 'agy',
+      args: [],
+      transportFactory: () => transport,
+    })
+
+    const handleA = await client.openSession({ cwd: '/repo/a' })
+    const handleB = await client.openSession({ cwd: '/repo/b' })
+    expect(client.activeSessionCount).toBe(2)
+
+    const onPermissionA = vi.fn(async () => ({ outcome: 'selected' as const, optionId: 'allow_once' }))
+    const turnA = handleA.runTurn([{ type: 'text', text: 'only A is running' }], {
+      onPermission: onPermissionA,
+    })
+
+    // Unlabelled session/update (missing sessionId) while 2 sessions are open MUST be dropped
+    transport.emit({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'UNLABELLED_LEAK' } },
+      },
+    })
+    // Unlabelled permission request while 2 sessions are open MUST be cancelled fail-closed
+    transport.emit({
+      jsonrpc: '2.0',
+      id: 777,
+      method: 'session/request_permission',
+      params: {
+        toolCall: { toolCallId: 'p_unlabelled', name: 'run_command' },
+        options: [{ optionId: 'allow_once', name: 'Allow', kind: 'allow_once' }],
+      },
+    })
+    // Properly labelled update for session A succeeds normally
+    transport.emit({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId: handleA.sessionId,
+        update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'SAFE_A' } },
+      },
+    })
+    transport.emit({ jsonrpc: '2.0', id: promptIds.get(handleA.sessionId), result: { stopReason: 'end_turn' } })
+
+    const resA = await turnA
+    expect(resA.text).toBe('SAFE_A')
+    expect(onPermissionA).not.toHaveBeenCalled()
+    expect(permissionReplies).toEqual([{ id: 777, result: { outcome: { outcome: 'cancelled' } } }])
+
+    await handleA.close()
+    await handleB.close()
+    await client.close()
+  })
 })
