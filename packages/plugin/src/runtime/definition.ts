@@ -43,6 +43,8 @@ export interface ExternalRuntimeDefinition extends ExternalRuntimeSummary {
   ): { readonly defaultModel?: string; readonly defaultReasoningEffort?: string }
   probeModels(profile?: ExternalRuntimeProfile): Promise<readonly CatalogModelEntry[]>
   createDriver(host: ExternalRuntimeHost): ExternalRuntimeDriver
+  invalidateProfile?(profileId?: string): Promise<void>
+  dispose?(): Promise<void>
 }
 
 /** Copy only the summary fields so callers never receive driver factories. */

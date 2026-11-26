@@ -1492,4 +1492,202 @@ describe('AcpRuntimeClient prompt idle timeout', () => {
     expect(goodTransport.closed).toBe(false)
     await client.close()
   })
+
+  it('multiplexes concurrent sessions on one transport with per-session cwd, updates, permissions, isolated cancel, and session/close', async () => {
+    let spawnCount = 0
+    let sessionSeq = 0
+    const promptIds = new Map<string, number | string>()
+    const openedCwds: string[] = []
+    const closedSessions: string[] = []
+
+    const transport = new MockAcpTransport((msg, t) => {
+      if (msg.method === 'initialize') {
+        t.emit({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            protocolVersion: 1,
+            agentCapabilities: {
+              loadSession: true,
+              sessionCapabilities: { resume: {}, close: {} },
+            },
+            authMethods: [{ id: 'oauth-personal', name: 'Google' }],
+          },
+        })
+      } else if (msg.method === 'authenticate') {
+        t.emit({ jsonrpc: '2.0', id: msg.id, result: {} })
+      } else if (msg.method === 'session/new') {
+        const params = msg.params as { cwd?: string }
+        openedCwds.push(params.cwd ?? '')
+        const sid = `mux_sess_${++sessionSeq}`
+        t.emit({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            sessionId: sid,
+            configOptions: [
+              {
+                id: 'model',
+                category: 'model',
+                type: 'select',
+                currentValue: 'model-default',
+                options: [{ value: 'model-default', name: 'Default' }],
+              },
+            ],
+          },
+        })
+      } else if (msg.method === 'session/prompt') {
+        const params = msg.params as { sessionId: string }
+        promptIds.set(params.sessionId, msg.id!)
+      } else if (msg.method === 'session/cancel') {
+        const params = msg.params as { sessionId: string }
+        const pid = promptIds.get(params.sessionId)
+        if (pid !== undefined) {
+          promptIds.delete(params.sessionId)
+          t.emit({ jsonrpc: '2.0', id: pid, result: { stopReason: 'cancelled' } })
+        }
+      } else if (msg.method === 'session/close') {
+        const params = msg.params as { sessionId: string }
+        closedSessions.push(params.sessionId)
+        t.emit({ jsonrpc: '2.0', id: msg.id, result: {} })
+      }
+    })
+
+    const client = new AcpRuntimeClient({
+      cwd: '/root',
+      command: 'agy',
+      args: ['acp', '--stdio'],
+      authMethodId: 'oauth-personal',
+      transportFactory: () => {
+        spawnCount += 1
+        return transport
+      },
+    })
+
+    // Open two sessions concurrently: must share a single initialize + authenticate handshake
+    const [handleA, handleB] = await Promise.all([
+      client.openSession({ cwd: '/workspace/alpha' }),
+      client.openSession({ cwd: '/workspace/beta' }),
+    ])
+    expect(spawnCount).toBe(1)
+    expect(transport.sent.filter((m) => m.method === 'initialize')).toHaveLength(1)
+    expect(transport.sent.filter((m) => m.method === 'authenticate')).toHaveLength(1)
+    expect(openedCwds).toEqual(['/workspace/alpha', '/workspace/beta'])
+    expect(client.activeSessionCount).toBe(2)
+    expect(handleA.isOpen).toBe(true)
+    expect(handleB.isOpen).toBe(true)
+
+    const eventsA: string[] = []
+    const eventsB: string[] = []
+    const abortA = new AbortController()
+    const turnA = handleA.runTurn(
+      [{ type: 'text', text: 'run A' }],
+      { onEvent: (ev) => { if (ev.type === 'text-delta') eventsA.push(ev.text) } },
+      abortA.signal,
+    )
+    const turnB = handleB.runTurn(
+      [{ type: 'text', text: 'run B' }],
+      { onEvent: (ev) => { if (ev.type === 'text-delta') eventsB.push(ev.text) } },
+    )
+    expect(client.inFlightTurnCount).toBe(2)
+
+    // Interleaved updates route strictly to their owning session
+    transport.emit({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId: handleA.sessionId,
+        update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'A1' } },
+      },
+    })
+    transport.emit({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId: handleB.sessionId,
+        update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'B1' } },
+      },
+    })
+
+    // Cancelling A must leave B unaffected
+    abortA.abort()
+    const resA = await turnA
+    expect(resA.stopReason).toBe('cancelled')
+    expect(eventsA).toEqual(['A1'])
+
+    transport.emit({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: {
+        sessionId: handleB.sessionId,
+        update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'B2' } },
+      },
+    })
+    transport.emit({ jsonrpc: '2.0', id: promptIds.get(handleB.sessionId), result: { stopReason: 'end_turn' } })
+    const resB = await turnB
+    expect(resB.stopReason).toBe('end_turn')
+    expect(resB.text).toBe('B1B2')
+    expect(eventsB).toEqual(['B1', 'B2'])
+    expect(client.inFlightTurnCount).toBe(0)
+
+    // Closing A calls session/close and keeps B open
+    await handleA.close()
+    expect(closedSessions).toEqual([handleA.sessionId])
+    expect(handleA.isOpen).toBe(false)
+    expect(handleB.isOpen).toBe(true)
+    expect(client.activeSessionCount).toBe(1)
+
+    await handleB.close()
+    expect(client.activeSessionCount).toBe(0)
+    await client.close()
+  })
+
+  it('includes diagnostic metadata in idle timeout error message', async () => {
+    vi.useFakeTimers()
+    try {
+      const transport = new MockAcpTransport((msg, t) => {
+        if (msg.method === 'initialize') {
+          t.emit({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1 } })
+        } else if (msg.method === 'session/new') {
+          t.emit({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 'acp_diag' } })
+        } else if (msg.method === 'session/prompt') {
+          t.emit({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'acp_diag',
+              update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'hello world' } },
+            },
+          })
+          t.emit({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: 'acp_diag',
+              update: { sessionUpdate: 'usage_update', used: 1200, size: 100000 },
+            },
+          })
+        }
+      })
+
+      const client = new AcpRuntimeClient({
+        cwd: '/repo',
+        command: 'agy',
+        args: [],
+        promptIdleTimeoutMs: 100,
+        transportFactory: () => transport,
+      })
+      await client.startOrResume()
+
+      const turnPromise = client.runTurn([{ type: 'text', text: 'stuck after output' }])
+      const expectation = expect(turnPromise).rejects.toThrow(
+        /idle timed out after 100ms without updates \(session=acp_diag, elapsed=\d+s, updates=2, lastUpdate=usage_update, textChars=11, openTools=0\)/,
+      )
+      await vi.advanceTimersByTimeAsync(110)
+      await expectation
+      await client.close()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
 })

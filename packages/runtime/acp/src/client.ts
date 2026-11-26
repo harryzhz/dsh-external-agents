@@ -1,6 +1,7 @@
 import { AcpRpcError, isAuthRequired, isMethodNotFound, isResourceNotFound } from './errors.js'
 import {
   extractAcpPromptUsage,
+  extractAcpSessionUpdateMeta,
   normalizeAcpPermissionRequest,
   normalizeAcpSessionUpdate,
   parseAcpCatalog,
@@ -17,6 +18,7 @@ import type {
   AcpJsonRpcTransport,
   AcpPromptBlock,
   AcpRuntimeOptions,
+  AcpSessionHandle,
   AcpStartOptions,
   AcpTokenUsage,
   AcpTransportFactoryOptions,
@@ -27,6 +29,7 @@ import type {
 const DEFAULT_REQUEST_TIMEOUT_MS = 120_000
 /** `initialize` also covers process cold start (e.g. `npx` fetching the agent package). */
 const STARTUP_TIMEOUT_MS = 5 * 60_000
+const CLOSE_SESSION_TIMEOUT_MS = 3_000
 /**
  * Default inactivity timeout for an in-flight `session/prompt` turn.
  * Unlike a fixed wall-clock deadline, this timer resets on every `session/update`
@@ -44,9 +47,13 @@ interface PendingRequest {
 }
 
 interface ActiveTurnContext {
+  readonly sessionId: string
+  readonly startedAtMs: number
   text: string
   usage?: AcpTokenUsage
   cancelPending: boolean
+  updateCount: number
+  lastUpdateKind?: string
   readonly activeTools: Map<string, AcpActiveToolCall>
   readonly handlers: AcpTurnHandlers
   readonly abortController: AbortController
@@ -56,12 +63,23 @@ interface ActiveTurnContext {
   beginCancelGrace?: () => void
 }
 
+interface AcpSessionState {
+  readonly sessionId: string
+  readonly cwd: string
+  catalogSnapshot: AcpCatalogSnapshot
+  activeTurn?: ActiveTurnContext
+}
+
 interface OpenedSession {
   readonly sessionId: string
   readonly result: unknown
 }
 
-/** Generic Agent Client Protocol (ACP) client over a stdio JSON-RPC transport. */
+/**
+ * Generic Agent Client Protocol (ACP) client over a stdio JSON-RPC transport.
+ * Supports both single-session usage (`startOrResume` / `runTurn`) and
+ * multiplexed multi-session hosting (`openSession` -> `AcpSessionHandle`).
+ */
 export class AcpRuntimeClient {
   private readonly cwd: string
   private readonly command: string
@@ -81,11 +99,13 @@ export class AcpRuntimeClient {
   private transport?: AcpJsonRpcTransport
   private nextId = 1
   private initResult?: AcpInitializeResult
+  private initPromise?: Promise<AcpInitializeResult>
   private authenticatedMethodId?: string
+  private authPromise?: Promise<void>
   private closed = false
-  private currentSessionId?: string
-  private catalogSnapshot?: AcpCatalogSnapshot
-  private activeTurn?: ActiveTurnContext
+  private defaultSessionId?: string
+  private lastCatalogSnapshot?: AcpCatalogSnapshot
+  private readonly sessions = new Map<string, AcpSessionState>()
   private readonly pending = new Map<number, PendingRequest>()
 
   constructor(options: AcpRuntimeOptions) {
@@ -115,11 +135,19 @@ export class AcpRuntimeClient {
   }
 
   get sessionId(): string | undefined {
-    return this.currentSessionId
+    return this.defaultSessionId
   }
 
   get catalog(): AcpCatalogSnapshot | undefined {
-    return this.catalogSnapshot
+    if (this.defaultSessionId) {
+      return this.sessions.get(this.defaultSessionId)?.catalogSnapshot ?? this.lastCatalogSnapshot
+    }
+    return this.lastCatalogSnapshot
+  }
+
+  /** Most recently observed catalog snapshot across all sessions on this connection. */
+  get cachedCatalog(): AcpCatalogSnapshot | undefined {
+    return this.lastCatalogSnapshot
   }
 
   /** Result of the most recent `initialize` handshake. */
@@ -131,9 +159,144 @@ export class AcpRuntimeClient {
     return Boolean(this.transport && this.initResult && !this.closed)
   }
 
+  /** Number of currently open multiplexed sessions on this connection. */
+  get activeSessionCount(): number {
+    return this.sessions.size
+  }
+
+  /** Number of sessions with a `session/prompt` turn currently in flight. */
+  get inFlightTurnCount(): number {
+    let count = 0
+    for (const session of this.sessions.values()) {
+      if (session.activeTurn) count += 1
+    }
+    return count
+  }
+
   async initialize(): Promise<AcpInitializeResult> {
     if (this.initResult && this.transport && !this.closed) return this.initResult
+    if (this.initPromise) return await this.initPromise
     this.closed = false
+    const pendingInit = this.performInitialize().finally(() => {
+      if (this.initPromise === pendingInit) {
+        this.initPromise = undefined
+      }
+    })
+    this.initPromise = pendingInit
+    return await pendingInit
+  }
+
+  async authenticate(methodId: string): Promise<void> {
+    const clean = methodId.trim()
+    if (!clean) return
+    while (this.authPromise) {
+      await this.authPromise.catch(() => {})
+    }
+    if (this.authenticatedMethodId === clean && this.isConnected) return
+    const pendingAuth = this.performAuthenticate(clean).finally(() => {
+      if (this.authPromise === pendingAuth) {
+        this.authPromise = undefined
+      }
+    })
+    this.authPromise = pendingAuth
+    await pendingAuth
+  }
+
+  /**
+   * Open or restore an ACP session and return a dedicated handle bound to its
+   * `sessionId`. Multiple handles can coexist and execute `runTurn()` concurrently
+   * over the same stdio JSON-RPC connection.
+   */
+  async openSession(options: AcpStartOptions = {}): Promise<AcpSessionHandle> {
+    const state = await this.openSessionState(options)
+    return this.createSessionHandle(state.sessionId)
+  }
+
+  /**
+   * Single-session convenience wrapper: opens or resumes a session and sets it
+   * as the client's default session for `runTurn` / `setModel` / `setMode`.
+   */
+  async startOrResume(options: AcpStartOptions = {}): Promise<string> {
+    const state = await this.openSessionState(options)
+    this.defaultSessionId = state.sessionId
+    return state.sessionId
+  }
+
+  async closeSession(sessionId: string): Promise<void> {
+    const state = this.sessions.get(sessionId)
+    if (!state) return
+    this.sessions.delete(sessionId)
+    if (this.defaultSessionId === sessionId) {
+      this.defaultSessionId = undefined
+    }
+    if (state.activeTurn) {
+      state.activeTurn.cancelPending = true
+      state.activeTurn.abortController.abort()
+      state.activeTurn.beginCancelGrace?.()
+      this.notify('session/cancel', { sessionId })
+    }
+    if (this.isConnected && this.initResult?.agentCapabilities.closeSession) {
+      await this.request('session/close', { sessionId }, CLOSE_SESSION_TIMEOUT_MS).catch(() => {})
+    }
+  }
+
+  async setModel(modelId: string): Promise<void> {
+    if (!this.defaultSessionId) return
+    await this.setModelForSession(this.defaultSessionId, modelId)
+  }
+
+  async setThoughtLevel(thoughtLevel: string): Promise<void> {
+    if (!this.defaultSessionId) return
+    await this.setThoughtLevelForSession(this.defaultSessionId, thoughtLevel)
+  }
+
+  async setMode(modeId: string): Promise<void> {
+    if (!this.defaultSessionId) return
+    await this.setModeForSession(this.defaultSessionId, modeId)
+  }
+
+  async runTurn(
+    prompt: readonly AcpPromptBlock[],
+    handlers: AcpTurnHandlers = {},
+    signal?: AbortSignal,
+  ): Promise<AcpTurnResult> {
+    if (!this.defaultSessionId) {
+      throw new Error('AcpRuntimeClient.runTurn called before startOrResume()')
+    }
+    return await this.runTurnForSession(this.defaultSessionId, prompt, handlers, signal)
+  }
+
+  async close(): Promise<void> {
+    if (this.closed) return
+    this.closed = true
+    const transport = this.transport
+    this.transport = undefined
+    this.initResult = undefined
+    this.initPromise = undefined
+    this.authenticatedMethodId = undefined
+    this.authPromise = undefined
+    this.defaultSessionId = undefined
+    this.abortAllActiveTurns()
+    this.sessions.clear()
+    this.failPending(new Error(`${this.label} runtime closed`))
+    if (transport) {
+      await transport.close()
+    }
+  }
+
+  static async probeCatalog(options: AcpRuntimeOptions): Promise<AcpCatalogSnapshot> {
+    const client = new AcpRuntimeClient(options)
+    try {
+      const handle = await client.openSession()
+      const snap = handle.catalog ?? { models: [], modes: [] }
+      await handle.close().catch(() => {})
+      return snap
+    } finally {
+      await client.close()
+    }
+  }
+
+  private async performInitialize(): Promise<AcpInitializeResult> {
     const transport = this.transportFactory({
       command: this.command,
       args: this.args,
@@ -170,9 +333,7 @@ export class AcpRuntimeClient {
     }
   }
 
-  async authenticate(methodId: string): Promise<void> {
-    const clean = methodId.trim()
-    if (!clean) return
+  private async performAuthenticate(clean: string): Promise<void> {
     const init = await this.initialize()
     if (init.authMethods.length > 0 && !init.authMethods.some((m) => m.id === clean)) {
       const supported = init.authMethods.map((m) => m.id).join(', ')
@@ -182,26 +343,21 @@ export class AcpRuntimeClient {
     this.authenticatedMethodId = clean
   }
 
-  /**
-   * Open a session. With `sessionId`, recovery follows negotiated capabilities:
-   * `session/resume` first (unless declared unsupported), then `session/load`
-   * when the agent advertises `loadSession`, otherwise a fresh `session/new`.
-   * The returned id differs from `options.sessionId` only in the last case.
-   */
-  async startOrResume(options: AcpStartOptions = {}): Promise<string> {
+  private async openSessionState(options: AcpStartOptions): Promise<AcpSessionState> {
     const init = await this.initialize()
     const targetAuthMethod = options.authMethodId?.trim() || this.defaultAuthMethodId
     if (targetAuthMethod && this.authenticatedMethodId !== targetAuthMethod) {
       await this.authenticate(targetAuthMethod)
     }
+    const sessionCwd = options.cwd?.trim() || this.cwd
     const sessionMeta =
       options.sessionMeta && Object.keys(options.sessionMeta).length > 0
         ? options.sessionMeta
         : this.defaultSessionMeta
     const open = (): Promise<OpenedSession> =>
       options.sessionId
-        ? this.restoreSession(options.sessionId, init.agentCapabilities, sessionMeta)
-        : this.newSession(sessionMeta)
+        ? this.restoreSession(options.sessionId, sessionCwd, init.agentCapabilities, sessionMeta)
+        : this.newSession(sessionCwd, sessionMeta)
 
     let opened: OpenedSession
     try {
@@ -218,65 +374,97 @@ export class AcpRuntimeClient {
       await this.authenticate(fallbackAuthMethod)
       opened = await open()
     }
-    this.currentSessionId = opened.sessionId
+
     const parsedCatalog = parseAcpCatalog(opened.result)
-    this.catalogSnapshot =
+    const catalogSnapshot: AcpCatalogSnapshot =
       init.authMethods.length > 0
         ? { ...parsedCatalog, authMethods: init.authMethods }
         : parsedCatalog
 
-    const normalized = this.normalizeModelAndThought(options.modelId, options.thoughtLevel)
-    if (normalized.modelId && normalized.modelId !== this.catalogSnapshot.currentModelId) {
-      await this.applyStartModel(normalized.modelId)
+    const state: AcpSessionState = {
+      sessionId: opened.sessionId,
+      cwd: sessionCwd,
+      catalogSnapshot,
     }
-    if (normalized.thoughtLevel && normalized.thoughtLevel !== this.catalogSnapshot.currentThoughtLevel) {
-      await this.applyStartThoughtLevel(normalized.thoughtLevel)
+    this.sessions.set(opened.sessionId, state)
+    this.lastCatalogSnapshot = catalogSnapshot
+
+    const normalized = this.normalizeModelAndThought(state.catalogSnapshot, options.modelId, options.thoughtLevel)
+    if (normalized.modelId && normalized.modelId !== state.catalogSnapshot.currentModelId) {
+      await this.applyStartModel(state.sessionId, normalized.modelId)
     }
-    if (options.modeId && options.modeId !== this.catalogSnapshot.currentModeId) {
-      await this.setMode(options.modeId)
+    if (normalized.thoughtLevel && normalized.thoughtLevel !== state.catalogSnapshot.currentThoughtLevel) {
+      await this.applyStartThoughtLevel(state.sessionId, normalized.thoughtLevel)
     }
-    return opened.sessionId
+    if (options.modeId && options.modeId !== state.catalogSnapshot.currentModeId) {
+      await this.setModeForSession(state.sessionId, options.modeId)
+    }
+    return state
   }
 
-  async setModel(modelId: string): Promise<void> {
-    if (!this.currentSessionId) return
-    const normalized = this.normalizeModelAndThought(modelId, undefined)
+  private createSessionHandle(sessionId: string): AcpSessionHandle {
+    let handleClosed = false
+    const client = this
+    return {
+      sessionId,
+      get isOpen(): boolean {
+        return !handleClosed && client.isConnected && client.sessions.has(sessionId)
+      },
+      get catalog(): AcpCatalogSnapshot | undefined {
+        return client.sessions.get(sessionId)?.catalogSnapshot ?? client.lastCatalogSnapshot
+      },
+      setModel: (modelId: string) => this.setModelForSession(sessionId, modelId),
+      setThoughtLevel: (thoughtLevel: string) => this.setThoughtLevelForSession(sessionId, thoughtLevel),
+      setMode: (modeId: string) => this.setModeForSession(sessionId, modeId),
+      runTurn: (prompt, handlers, signal) => this.runTurnForSession(sessionId, prompt, handlers, signal),
+      close: async () => {
+        if (handleClosed) return
+        handleClosed = true
+        await this.closeSession(sessionId)
+      },
+    }
+  }
+
+  private async setModelForSession(sessionId: string, modelId: string): Promise<void> {
+    const state = this.sessions.get(sessionId)
+    if (!state) return
+    const normalized = this.normalizeModelAndThought(state.catalogSnapshot, modelId, undefined)
     const targetModelId = normalized.modelId ?? modelId
-    const configId = this.catalogSnapshot?.modelConfigOptionId
+    const configId = state.catalogSnapshot.modelConfigOptionId
     if (configId) {
       const res = await this.request('session/set_config_option', {
-        sessionId: this.currentSessionId,
+        sessionId,
         configId,
         value: targetModelId,
       })
-      this.mergeConfigOptionsSnapshot(res, { currentModelId: targetModelId })
+      this.mergeConfigOptionsSnapshot(state, res, { currentModelId: targetModelId })
       if (normalized.inferredThoughtLevel) {
-        await this.setThoughtLevel(normalized.inferredThoughtLevel)
+        await this.setThoughtLevelForSession(sessionId, normalized.inferredThoughtLevel)
       }
     } else {
       await this.request('session/set_model', {
-        sessionId: this.currentSessionId,
+        sessionId,
         modelId: targetModelId,
       })
-      if (this.catalogSnapshot) {
-        this.catalogSnapshot = { ...this.catalogSnapshot, currentModelId: targetModelId }
-      }
+      state.catalogSnapshot = { ...state.catalogSnapshot, currentModelId: targetModelId }
+      this.lastCatalogSnapshot = state.catalogSnapshot
     }
   }
 
-  async setThoughtLevel(thoughtLevel: string): Promise<void> {
-    if (!this.currentSessionId) return
-    const snap = this.catalogSnapshot
-    const configId = snap?.thoughtConfigOptionId
+  private async setThoughtLevelForSession(sessionId: string, thoughtLevel: string): Promise<void> {
+    const state = this.sessions.get(sessionId)
+    if (!state) return
+    const snap = state.catalogSnapshot
+    const configId = snap.thoughtConfigOptionId
     if (!configId) return
 
-    const available = snap?.thoughtLevels ?? []
+    const available = snap.thoughtLevels ?? []
     let targetValue = thoughtLevel.trim()
     if (!targetValue) {
       if (available.some((t) => t.id === 'default')) {
         targetValue = 'default'
       } else {
-        const currentModel = snap?.models.find((m) => m.id === snap.currentModelId)
+        const currentModel = snap.models.find((m) => m.id === snap.currentModelId)
         targetValue = currentModel?.defaultThoughtLevel ?? ''
       }
     }
@@ -286,33 +474,35 @@ export class AcpRuntimeClient {
       return
     }
     const res = await this.request('session/set_config_option', {
-      sessionId: this.currentSessionId,
+      sessionId,
       configId,
       value: targetValue,
     })
-    this.mergeConfigOptionsSnapshot(res, { currentThoughtLevel: targetValue })
+    this.mergeConfigOptionsSnapshot(state, res, { currentThoughtLevel: targetValue })
   }
 
-  async setMode(modeId: string): Promise<void> {
-    if (!this.currentSessionId) return
+  private async setModeForSession(sessionId: string, modeId: string): Promise<void> {
+    const state = this.sessions.get(sessionId)
+    if (!state) return
     await this.request('session/set_mode', {
-      sessionId: this.currentSessionId,
+      sessionId,
       modeId,
     })
-    if (this.catalogSnapshot) {
-      this.catalogSnapshot = { ...this.catalogSnapshot, currentModeId: modeId }
-    }
+    state.catalogSnapshot = { ...state.catalogSnapshot, currentModeId: modeId }
+    this.lastCatalogSnapshot = state.catalogSnapshot
   }
 
-  async runTurn(
+  private async runTurnForSession(
+    sessionId: string,
     prompt: readonly AcpPromptBlock[],
     handlers: AcpTurnHandlers = {},
     signal?: AbortSignal,
   ): Promise<AcpTurnResult> {
-    if (!this.currentSessionId) {
-      throw new Error('AcpRuntimeClient.runTurn called before startOrResume()')
+    const state = this.sessions.get(sessionId)
+    if (!state) {
+      throw new Error(`AcpRuntimeClient session "${sessionId}" is not open`)
     }
-    if (this.activeTurn) {
+    if (state.activeTurn) {
       throw new Error('AcpRuntimeClient already has an active turn in flight')
     }
     if (signal?.aborted) {
@@ -321,28 +511,30 @@ export class AcpRuntimeClient {
 
     const abortController = new AbortController()
     const turn: ActiveTurnContext = {
+      sessionId,
+      startedAtMs: Date.now(),
       text: '',
       cancelPending: false,
+      updateCount: 0,
       activeTools: new Map(),
       handlers,
       abortController,
     }
-    this.activeTurn = turn
+    state.activeTurn = turn
 
     const onExternalAbort = () => {
       turn.cancelPending = true
       abortController.abort(signal?.reason)
       turn.beginCancelGrace?.()
-      this.notify('session/cancel', { sessionId: this.currentSessionId })
+      this.notify('session/cancel', { sessionId })
     }
     signal?.addEventListener('abort', onExternalAbort, { once: true })
 
     try {
-      const res = (await this.requestPrompt(
-        this.currentSessionId,
-        prompt,
-        turn,
-      )) as { stopReason?: string; usage?: unknown }
+      const res = (await this.requestPrompt(sessionId, prompt, turn)) as {
+        stopReason?: string
+        usage?: unknown
+      }
       const usage = extractAcpPromptUsage(res?.usage) ?? turn.usage
       if (usage) {
         try {
@@ -359,40 +551,18 @@ export class AcpRuntimeClient {
     } finally {
       signal?.removeEventListener('abort', onExternalAbort)
       abortController.abort()
-      if (this.activeTurn === turn) {
-        this.activeTurn = undefined
+      if (state.activeTurn === turn) {
+        state.activeTurn = undefined
       }
     }
   }
 
-  async close(): Promise<void> {
-    if (this.closed) return
-    this.closed = true
-    const transport = this.transport
-    this.transport = undefined
-    this.initResult = undefined
-    this.authenticatedMethodId = undefined
-    this.failPending(new Error(`${this.label} runtime closed`))
-    if (transport) {
-      await transport.close()
-    }
-  }
-
-  static async probeCatalog(options: AcpRuntimeOptions): Promise<AcpCatalogSnapshot> {
-    const client = new AcpRuntimeClient(options)
-    try {
-      await client.startOrResume()
-      return client.catalog ?? { models: [], modes: [] }
-    } finally {
-      await client.close()
-    }
-  }
-
   private async newSession(
+    cwd: string,
     sessionMeta?: Readonly<Record<string, unknown>>,
   ): Promise<OpenedSession> {
     const res = (await this.request('session/new', {
-      cwd: this.cwd,
+      cwd,
       mcpServers: [],
       ...(sessionMeta ? { _meta: sessionMeta } : {}),
     })) as { sessionId?: unknown } | undefined
@@ -404,12 +574,13 @@ export class AcpRuntimeClient {
 
   private async restoreSession(
     sessionId: string,
+    cwd: string,
     capabilities: AcpAgentCapabilities,
     sessionMeta?: Readonly<Record<string, unknown>>,
   ): Promise<OpenedSession> {
     const params = {
       sessionId,
-      cwd: this.cwd,
+      cwd,
       mcpServers: [],
       ...(sessionMeta ? { _meta: sessionMeta } : {}),
     }
@@ -433,16 +604,16 @@ export class AcpRuntimeClient {
       if (!isResourceNotFound(err)) throw err
       this.logger(`${this.label} session ${sessionId} not found; starting a new session`)
     }
-    return await this.newSession(sessionMeta)
+    return await this.newSession(cwd, sessionMeta)
   }
 
   private normalizeModelAndThought(
+    snap: AcpCatalogSnapshot | undefined,
     rawModelId?: string,
     rawThoughtLevel?: string,
   ): { modelId?: string; thoughtLevel?: string; inferredThoughtLevel?: string } {
     const trimmedModel = rawModelId?.trim() || undefined
     const trimmedThought = rawThoughtLevel?.trim() || undefined
-    const snap = this.catalogSnapshot
     if (!trimmedModel || !snap?.modelConfigOptionId || snap.models.length === 0) {
       return {
         ...(trimmedModel ? { modelId: trimmedModel } : {}),
@@ -474,10 +645,11 @@ export class AcpRuntimeClient {
   }
 
   private mergeConfigOptionsSnapshot(
+    state: AcpSessionState,
     rawResult: unknown,
     fallbackPatch: Partial<AcpCatalogSnapshot>,
   ): void {
-    if (!this.catalogSnapshot) return
+    const current = state.catalogSnapshot
     if (
       rawResult &&
       typeof rawResult === 'object' &&
@@ -488,32 +660,40 @@ export class AcpRuntimeClient {
       const mergedModels =
         updated.models.length > 0
           ? updated.models.map((m) => {
-              const prev = this.catalogSnapshot?.models.find((pm) => pm.id === m.id)
-              return prev?.thoughtLevels ? { ...m, thoughtLevels: prev.thoughtLevels, ...(prev.defaultThoughtLevel ? { defaultThoughtLevel: prev.defaultThoughtLevel } : {}) } : m
+              const prev = current.models.find((pm) => pm.id === m.id)
+              return prev?.thoughtLevels
+                ? {
+                    ...m,
+                    thoughtLevels: prev.thoughtLevels,
+                    ...(prev.defaultThoughtLevel ? { defaultThoughtLevel: prev.defaultThoughtLevel } : {}),
+                  }
+                : m
             })
-          : this.catalogSnapshot.models
-      this.catalogSnapshot = {
-        ...this.catalogSnapshot,
+          : current.models
+      state.catalogSnapshot = {
+        ...current,
         ...fallbackPatch,
         models: mergedModels,
         thoughtLevels: updated.thoughtLevels,
-        currentModelId: updated.currentModelId ?? fallbackPatch.currentModelId ?? this.catalogSnapshot.currentModelId,
+        currentModelId: updated.currentModelId ?? fallbackPatch.currentModelId ?? current.currentModelId,
         currentThoughtLevel: updated.currentThoughtLevel ?? fallbackPatch.currentThoughtLevel,
         thoughtConfigOptionId: updated.thoughtConfigOptionId,
       }
+      this.lastCatalogSnapshot = state.catalogSnapshot
       return
     }
-    this.catalogSnapshot = { ...this.catalogSnapshot, ...fallbackPatch }
+    state.catalogSnapshot = { ...current, ...fallbackPatch }
+    this.lastCatalogSnapshot = state.catalogSnapshot
   }
 
-  private async applyStartModel(modelId: string): Promise<void> {
-    const available = this.catalogSnapshot?.models ?? []
+  private async applyStartModel(sessionId: string, modelId: string): Promise<void> {
+    const available = this.sessions.get(sessionId)?.catalogSnapshot.models ?? []
     if (available.length > 0 && !available.some((m) => m.id === modelId)) {
       this.logger(`${this.label} ignoring unknown modelId "${modelId}"`)
       return
     }
     try {
-      await this.setModel(modelId)
+      await this.setModelForSession(sessionId, modelId)
     } catch (err) {
       this.logger(
         `${this.label} session/set_model(${modelId}) failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -521,9 +701,9 @@ export class AcpRuntimeClient {
     }
   }
 
-  private async applyStartThoughtLevel(thoughtLevel: string): Promise<void> {
+  private async applyStartThoughtLevel(sessionId: string, thoughtLevel: string): Promise<void> {
     try {
-      await this.setThoughtLevel(thoughtLevel)
+      await this.setThoughtLevelForSession(sessionId, thoughtLevel)
     } catch (err) {
       this.logger(
         `${this.label} session/set_config_option(thought_level=${thoughtLevel}) failed: ${
@@ -565,9 +745,12 @@ export class AcpRuntimeClient {
         entry.timer = setTimeout(() => {
           if (!this.pending.delete(id)) return
           entry.timer = undefined
+          const elapsedSec = Math.max(0, Math.round((Date.now() - turn.startedAtMs) / 1000))
+          const diag = `session=${sessionId}, elapsed=${elapsedSec}s, updates=${turn.updateCount}, lastUpdate=${turn.lastUpdateKind ?? 'none'}, textChars=${turn.text.length}, openTools=${turn.activeTools.size}`
           const err = new Error(
-            `${this.label} RPC "session/prompt" idle timed out after ${idleTimeoutMs}ms without updates`,
+            `${this.label} RPC "session/prompt" idle timed out after ${idleTimeoutMs}ms without updates (${diag})`,
           )
+          this.logger(err.message)
           turn.cancelPending = true
           turn.abortController.abort(err)
           this.notify('session/cancel', { sessionId })
@@ -687,6 +870,19 @@ export class AcpRuntimeClient {
     }
   }
 
+  private resolveTurnForSession(sessionId?: string): ActiveTurnContext | undefined {
+    if (sessionId) {
+      return this.sessions.get(sessionId)?.activeTurn
+    }
+    let soleTurn: ActiveTurnContext | undefined
+    for (const state of this.sessions.values()) {
+      if (!state.activeTurn) continue
+      if (soleTurn) return undefined
+      soleTurn = state.activeTurn
+    }
+    return soleTurn
+  }
+
   private async handleServerRequest(
     id: number | string,
     method: string,
@@ -698,7 +894,7 @@ export class AcpRuntimeClient {
     }
 
     const request = normalizeAcpPermissionRequest(params)
-    const turn = this.activeTurn
+    const turn = this.resolveTurnForSession(request.sessionId)
     if (!turn || turn.cancelPending) {
       this.respond(id, { outcome: { outcome: 'cancelled' } })
       return
@@ -730,8 +926,13 @@ export class AcpRuntimeClient {
   }
 
   private handleSessionUpdate(params: unknown): void {
-    const turn = this.activeTurn
+    const meta = extractAcpSessionUpdateMeta(params)
+    const turn = this.resolveTurnForSession(meta.sessionId)
     if (!turn) return
+    turn.updateCount += 1
+    if (meta.updateKind) {
+      turn.lastUpdateKind = meta.updateKind
+    }
     turn.touchActivity?.()
     const events = normalizeAcpSessionUpdate(params, turn.activeTools)
     for (const event of events) {
@@ -748,11 +949,25 @@ export class AcpRuntimeClient {
     }
   }
 
+  private abortAllActiveTurns(): void {
+    for (const state of this.sessions.values()) {
+      if (state.activeTurn) {
+        state.activeTurn.abortController.abort()
+        state.activeTurn = undefined
+      }
+    }
+  }
+
   private handleTransportClosed(closedTransport: AcpJsonRpcTransport, error?: Error): void {
     if (this.transport !== closedTransport) return
     this.initResult = undefined
+    this.initPromise = undefined
     this.authenticatedMethodId = undefined
+    this.authPromise = undefined
     this.transport = undefined
+    this.defaultSessionId = undefined
+    this.abortAllActiveTurns()
+    this.sessions.clear()
     this.failPending(error ?? new Error(`${this.label} transport closed`))
   }
 

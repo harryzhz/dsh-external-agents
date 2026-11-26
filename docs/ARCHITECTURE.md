@@ -51,4 +51,5 @@ flowchart LR
 - **非侵入 `cordis.patch.yml`**：根包 `cordis.patch.yml` 仅禁用并包装 `agent-loop` 及追加外部运行时预设，**禁止**覆盖用户默认的 `agent-default-model`、`agent-preset-registry.default`、`session-title-llm` 或 `ui-settings-general`。
 - **零运行期外部依赖**：根包 `package.json` 必须保持 `dependencies: {}`，且 `devDependencies` 不引入 `@deepseek-ai/*`，确保用户通过 Git 仓库直装时 `prepare` 脚本极速构建。
 - **macOS Keychain 环境隔离**：启动依赖 macOS Keychain 的子进程（如 `agy acp`）时启用 `stripSshEnv: true`，剥离 `SSH_CONNECTION` / `SSH_CLIENT` / `SSH_TTY`（保留 `SSH_AUTH_SOCK`）。
+- **ACP 进程池与隔离数据目录**：对于内部维护共享会话存储的 ACP 运行时（如 `agy acp`），`AcpRuntimePool` 按 `(DSH 实例, runtime, profile)` 复用单个 `agy acp --stdio` 进程并多路复用并发会话，自动注入隔离的相对 `--app-data-dir`（保留宿主 `~/.gemini` 凭据与镜像 `settings.json`），冷态模型探测使用临时隔离目录并在退出后清理，避免跨进程互相 `Resuming conversation` 踩踏在途工具步；同时在 `ExternalRuntimeRegistry` 维护 `externalId → sessionId` 映射以支持上游按外部会话 ID 反查归属。
 - **Codex 冷恢复参数保护**：启动 `codex app-server` 冷恢复 `thread/resume` 时，除非用户显式切换模型，不得重传 `model` / `reasoning_effort` 覆盖参数。

@@ -93,9 +93,11 @@ interface MountedProfilePreset {
 export async function apply(ctx: Context, config: ExternalAgentsConfig): Promise<void> {
   const registry = createExternalRuntimeRegistry(config.runtimes, {
     ...(config.dataDir?.trim() ? { dataDir: config.dataDir.trim() } : {}),
+    idleEvictMs: config.idleEvictMs,
     catalogTtlMs: config.catalogTtlMs,
     onWarn: (msg) => ctx.logger.warn(msg),
   })
+  ctx.effect(() => () => registry.dispose(), 'dsh-external-agents.runtime-pools')
   const captured = await mountWrappedAgentLoop(ctx, config.maxParallelToolCalls)
 
   for (const runtime of registry.definitions()) {
@@ -226,6 +228,16 @@ export { effectivePresetOfSession } from './agent-loop-bridge.js'
 export { ExternalCatalogLlmAdapter, type CatalogModelEntry } from './catalog-adapter.js'
 export { ExternalAgentInbox } from './inbox.js'
 export { ExternalStepRecorder } from './step-recorder.js'
+export {
+  AcpRuntimePool,
+  buildAgyIsolatedAppDataDirName,
+  detectAcpExecutorError,
+  hasAgyDataDirFlag,
+  resolveDefaultInstanceScopeKey,
+  syncAgyBaseSettings,
+  type AcpPoolClientLike,
+  type AcpRuntimePoolOptions,
+} from './runtime/acp-pool.js'
 export {
   ExternalRuntimeRegistry,
   createExternalRuntimeRegistry,
