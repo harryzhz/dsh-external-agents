@@ -118,6 +118,7 @@ export type AcpTurnEvent =
       readonly meta?: Record<string, unknown>
     }
   | { readonly type: 'usage'; readonly usage: AcpTokenUsage }
+  | { readonly type: 'context-usage'; readonly used: number; readonly size?: number }
   | { readonly type: 'title'; readonly title: string }
 
 export interface AcpPermissionOption {
