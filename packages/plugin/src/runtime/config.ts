@@ -22,6 +22,11 @@ export interface ExternalRuntimeSpec extends ExternalRuntimeConfig {
   readonly defaultContextWindow?: number
   /** Ordered executable aliases probed across PATH when the user did not override `command`. */
   readonly commandCandidates?: readonly string[]
+  /**
+   * Share a single multiplexed ACP child process per `(instance, runtime, profile)`
+   * with isolated data directory storage (used for Antigravity `agy acp`).
+   */
+  readonly poolProcesses?: boolean
 }
 
 const CODEX_FALLBACK_MODELS: readonly CatalogModelEntry[] = [
@@ -142,6 +147,7 @@ export const BUILTIN_RUNTIMES: readonly ExternalRuntimeSpec[] = [
     ...CODEX_ONLY_DEFAULTS,
     fallbackModels: AGY_FALLBACK_MODELS,
     defaultContextWindow: 1_048_576,
+    poolProcesses: true,
   },
   {
     id: 'claude-code',

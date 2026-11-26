@@ -33,6 +33,7 @@ export interface ProfilePresetSyncHandler {
 
 export interface ExternalRuntimeRegistryOptions {
   readonly dataDir?: string
+  readonly idleEvictMs?: number
   readonly catalogTtlMs?: number
   readonly enableDiscovery?: boolean
   readonly processEnv?: NodeJS.ProcessEnv
@@ -53,6 +54,7 @@ export class ExternalRuntimeRegistry {
   private readonly exposedPresets = new Map<string, ExternalRuntimeDefinition>()
   private readonly catalogLoaders = new Map<string, () => Promise<readonly CatalogModelEntry[]>>()
   private readonly profileCatalogs = new Map<string, ExternalCatalogLlmAdapter>()
+  private readonly externalSessionIndex = new Map<string, string>()
   private profileStore?: RuntimeProfileStore
   private presetSyncHandler?: ProfilePresetSyncHandler
   private catalogTtlMs = 5 * 60_000
@@ -236,12 +238,30 @@ export class ExternalRuntimeRegistry {
     return this.profileStore?.listPublic(runtimeId) ?? []
   }
 
+  registerExternalSession(externalId: string, sessionId: string): void {
+    const ext = externalId.trim()
+    const sid = sessionId.trim()
+    if (!ext || !sid) return
+    this.externalSessionIndex.set(ext, sid)
+  }
+
+  resolveSessionIdByExternalId(externalId: string): string | undefined {
+    const ext = externalId.trim()
+    if (!ext) return undefined
+    return this.externalSessionIndex.get(ext)
+  }
+
+  async dispose(): Promise<void> {
+    await Promise.all([...this.runtimes.values()].map((def) => def.dispose?.().catch(() => {})))
+  }
+
   async upsertProfile(input: ExternalRuntimeProfileInput): Promise<ExternalRuntimeProfilePublicView> {
     if (!this.profileStore) {
       throw new Error('当前外部运行时注册表未启用启动配置管理')
     }
     const saved = this.profileStore.upsert(input)
     this.profileCatalogs.delete(profileCacheKey(saved.runtimeId, saved.id))
+    await this.runtimes.get(saved.runtimeId)?.invalidateProfile?.(saved.id)
     await this.syncExposedProfile(saved.runtimeId, saved.id)
     return this.profileStore.getPublic(saved.runtimeId, saved.id)!
   }
@@ -251,6 +271,7 @@ export class ExternalRuntimeRegistry {
     const existed = this.profileStore.delete(runtimeId, profileId)
     if (!existed) return false
     this.profileCatalogs.delete(profileCacheKey(runtimeId, profileId))
+    await this.runtimes.get(runtimeId)?.invalidateProfile?.(profileId)
     await this.syncExposedProfile(runtimeId, profileId)
     return true
   }
@@ -356,12 +377,19 @@ export class ExternalRuntimeRegistry {
   }
 }
 
-function createRuntimeDefinition(spec: ExternalRuntimeSpec): ExternalRuntimeDefinition {
+function createRuntimeDefinition(
+  spec: ExternalRuntimeSpec,
+  options: ExternalRuntimeRegistryOptions = {},
+): ExternalRuntimeDefinition {
   switch (spec.kind) {
     case 'codex-app-server':
       return createCodexRuntime(spec)
     case 'acp':
-      return createAcpRuntime(spec)
+      return createAcpRuntime(spec, {
+        ...(options.dataDir ? { dataDir: options.dataDir } : {}),
+        ...(options.idleEvictMs !== undefined ? { idleEvictMs: options.idleEvictMs } : {}),
+        ...(options.onWarn ? { onWarn: options.onWarn } : {}),
+      })
   }
 }
 
@@ -373,7 +401,7 @@ export function createExternalRuntimeRegistry(
   const specs = resolveRuntimeSpecs(overrides)
   const registry = new ExternalRuntimeRegistry()
   for (const spec of specs) {
-    if (spec.enabled) registry.register(createRuntimeDefinition(spec))
+    if (spec.enabled) registry.register(createRuntimeDefinition(spec, options))
   }
   const store = new RuntimeProfileStore({
     specs,

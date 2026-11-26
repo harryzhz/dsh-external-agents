@@ -9,6 +9,7 @@ import {
   type AcpPermissionRequest,
   type AcpPromptBlock,
   type AcpRuntimeOptions,
+  type AcpSessionHandle,
 } from '@dsh-external-agents/runtime-acp'
 import type { CatalogModelEntry } from '../catalog-adapter.js'
 import type { ExternalAgent } from '../external-agent.js'
@@ -21,6 +22,11 @@ import type {
   ExternalTurnRunResult,
 } from '../types.js'
 import {
+  AcpRuntimePool,
+  detectAcpExecutorError,
+  resolveDefaultInstanceScopeKey,
+} from './acp-pool.js'
+import {
   contextWindowFor,
   expandRuntimeCwd,
   type ExternalRuntimeSpec,
@@ -32,6 +38,13 @@ import {
   resolveProfileDefaults,
   resolveRuntimeLaunchPlan,
 } from './profile-resolver.js'
+
+export interface CreateAcpRuntimeOptions {
+  readonly dataDir?: string
+  readonly idleEvictMs?: number
+  readonly onWarn?: (message: string) => void
+  readonly pool?: AcpRuntimePool
+}
 
 async function extractAcpPromptBlocks(
   ctx: Context,
@@ -96,7 +109,55 @@ function launchOptions(
   }
 }
 
-class AcpDriverAdapter implements ExternalRuntimeDriver {
+async function executeAcpHandleTurn(
+  ctx: Context,
+  agent: ExternalAgent,
+  handle: Pick<AcpSessionHandle, 'setModel' | 'setThoughtLevel' | 'runTurn'>,
+  request: ExternalTurnRequest,
+  onEvent: (event: ExternalTurnEvent) => void,
+  signal: AbortSignal,
+): Promise<ExternalTurnRunResult> {
+  if (request.modelChangedSinceStart) {
+    if (request.model) {
+      await handle.setModel(request.model)
+    }
+    await handle.setThoughtLevel(request.reasoningEffort ?? '')
+  }
+  const promptBlocks = await extractAcpPromptBlocks(ctx, request.messages, signal)
+  let lastStepText = ''
+  const res = await handle.runTurn(
+    promptBlocks,
+    {
+      onEvent: (event) => {
+        if (event.type === 'tool-start' || event.type === 'tool-complete') {
+          lastStepText = ''
+        } else if (event.type === 'text-delta') {
+          lastStepText += event.text
+        }
+        onEvent(event)
+      },
+      onPermission: (req, sig) => bridgeAcpPermission(ctx, agent, req, sig),
+    },
+    signal,
+  )
+  const interrupted = res.stopReason === 'cancelled' || signal.aborted
+  if (!interrupted) {
+    const executorError = detectAcpExecutorError(lastStepText)
+    if (executorError) {
+      return {
+        status: 'failed',
+        errorMessage: executorError,
+        ...(res.usage ? { usage: res.usage } : {}),
+      }
+    }
+  }
+  return {
+    status: interrupted ? 'interrupted' : 'completed',
+    ...(res.usage ? { usage: res.usage } : {}),
+  }
+}
+
+class DedicatedAcpDriverAdapter implements ExternalRuntimeDriver {
   readonly kind: string
   private readonly client: AcpRuntimeClient
 
@@ -138,26 +199,7 @@ class AcpDriverAdapter implements ExternalRuntimeDriver {
     onEvent: (event: ExternalTurnEvent) => void,
     signal: AbortSignal,
   ): Promise<ExternalTurnRunResult> {
-    if (request.modelChangedSinceStart) {
-      if (request.model) {
-        await this.client.setModel(request.model)
-      }
-      await this.client.setThoughtLevel(request.reasoningEffort ?? '')
-    }
-    const promptBlocks = await extractAcpPromptBlocks(this.ctx, request.messages, signal)
-    const res = await this.client.runTurn(
-      promptBlocks,
-      {
-        onEvent,
-        onPermission: (req, sig) => bridgeAcpPermission(this.ctx, this.agent, req, sig),
-      },
-      signal,
-    )
-    const interrupted = res.stopReason === 'cancelled' || signal.aborted
-    return {
-      status: interrupted ? 'interrupted' : 'completed',
-      ...(res.usage ? { usage: res.usage } : {}),
-    }
+    return await executeAcpHandleTurn(this.ctx, this.agent, this.client, request, onEvent, signal)
   }
 
   async close(): Promise<void> {
@@ -165,9 +207,97 @@ class AcpDriverAdapter implements ExternalRuntimeDriver {
   }
 }
 
+class PooledAcpDriverAdapter implements ExternalRuntimeDriver {
+  readonly kind: string
+  private sessionHandle?: AcpSessionHandle
+  private releaseHandle?: () => Promise<void>
+
+  constructor(
+    private readonly ctx: Context,
+    private readonly agent: ExternalAgent,
+    private readonly pool: AcpRuntimePool,
+    spec: ExternalRuntimeSpec,
+    private readonly profile?: ExternalRuntimeProfile,
+  ) {
+    this.kind = spec.id
+  }
+
+  get externalId(): string | undefined {
+    return this.sessionHandle?.sessionId
+  }
+
+  async ensureConnected(
+    existingExternalId?: string,
+    model?: string,
+    reasoningEffort?: string,
+  ): Promise<string> {
+    if (this.sessionHandle?.isOpen) {
+      return this.sessionHandle.sessionId
+    }
+    if (this.releaseHandle) {
+      await this.releaseHandle().catch(() => {})
+      this.sessionHandle = undefined
+      this.releaseHandle = undefined
+    }
+    const opened = await this.pool.openSession(
+      this.profile,
+      {
+        cwd: expandRuntimeCwd(this.agent.session.header.cwd),
+        ...(existingExternalId ? { sessionId: existingExternalId } : {}),
+        ...(model ? { modelId: model } : {}),
+        ...(reasoningEffort ? { thoughtLevel: reasoningEffort } : {}),
+      },
+      (msg) => this.ctx.logger.warn(msg),
+    )
+    this.sessionHandle = opened.handle
+    this.releaseHandle = opened.release
+    return opened.handle.sessionId
+  }
+
+  async runTurn(
+    request: ExternalTurnRequest,
+    onEvent: (event: ExternalTurnEvent) => void,
+    signal: AbortSignal,
+  ): Promise<ExternalTurnRunResult> {
+    if (!this.sessionHandle) {
+      throw new Error(`Pooled ACP driver for "${this.kind}" called runTurn before ensureConnected()`)
+    }
+    return await executeAcpHandleTurn(
+      this.ctx,
+      this.agent,
+      this.sessionHandle,
+      request,
+      onEvent,
+      signal,
+    )
+  }
+
+  async close(): Promise<void> {
+    const release = this.releaseHandle
+    this.sessionHandle = undefined
+    this.releaseHandle = undefined
+    if (release) {
+      await release()
+    }
+  }
+}
+
 /** Any agent speaking the Agent Client Protocol over stdio. */
-export function createAcpRuntime(spec: ExternalRuntimeSpec): ExternalRuntimeDefinition {
+export function createAcpRuntime(
+  spec: ExternalRuntimeSpec,
+  options: CreateAcpRuntimeOptions = {},
+): ExternalRuntimeDefinition {
   let cachedAuthMethods: readonly ExternalRuntimeAuthMethod[] | undefined
+  const pool =
+    options.pool ??
+    (spec.poolProcesses
+      ? new AcpRuntimePool({
+          spec,
+          instanceScopeKey: resolveDefaultInstanceScopeKey(options.dataDir),
+          ...(options.idleEvictMs !== undefined ? { idleEvictMs: options.idleEvictMs } : {}),
+          ...(options.onWarn ? { logger: options.onWarn } : {}),
+        })
+      : undefined)
 
   return {
     ...toRuntimeSummary(spec),
@@ -177,14 +307,16 @@ export function createAcpRuntime(spec: ExternalRuntimeSpec): ExternalRuntimeDefi
     resolveProfileDefaults: (profile) => resolveProfileDefaults(spec, profile),
     async probeModels(profile?: ExternalRuntimeProfile): Promise<readonly CatalogModelEntry[]> {
       const plan = resolveRuntimeLaunchPlan(spec, profile)
-      const snapshot = await AcpRuntimeClient.probeCatalog({
-        cwd: process.cwd(),
-        command: plan.command,
-        args: plan.args,
-        env: plan.env,
-        ...(plan.authMethodId ? { authMethodId: plan.authMethodId } : {}),
-        ...(plan.sessionMeta ? { sessionMeta: plan.sessionMeta } : {}),
-      })
+      const snapshot = pool
+        ? await pool.probeCatalog(profile)
+        : await AcpRuntimeClient.probeCatalog({
+            cwd: process.cwd(),
+            command: plan.command,
+            args: plan.args,
+            env: plan.env,
+            ...(plan.authMethodId ? { authMethodId: plan.authMethodId } : {}),
+            ...(plan.sessionMeta ? { sessionMeta: plan.sessionMeta } : {}),
+          })
       if (snapshot.authMethods && snapshot.authMethods.length > 0) {
         cachedAuthMethods = snapshot.authMethods
       }
@@ -209,6 +341,15 @@ export function createAcpRuntime(spec: ExternalRuntimeSpec): ExternalRuntimeDefi
         }
       })
     },
-    createDriver: ({ ctx, agent, profile }) => new AcpDriverAdapter(ctx, agent, spec, profile),
+    createDriver: ({ ctx, agent, profile }) =>
+      pool
+        ? new PooledAcpDriverAdapter(ctx, agent, pool, spec, profile)
+        : new DedicatedAcpDriverAdapter(ctx, agent, spec, profile),
+    ...(pool
+      ? {
+          invalidateProfile: (profileId?: string) => pool.invalidateProfile(profileId),
+          dispose: () => pool.disposeAll(),
+        }
+      : {}),
   }
 }

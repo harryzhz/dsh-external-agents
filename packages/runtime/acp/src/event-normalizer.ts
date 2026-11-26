@@ -71,6 +71,13 @@ export function parseAcpInitializeResult(result: unknown): AcpInitializeResult {
       ? 'supported'
       : 'unsupported'
 
+  const closeSession = Boolean(
+    sessionCaps &&
+      sessionCaps.close !== undefined &&
+      sessionCaps.close !== null &&
+      sessionCaps.close !== false,
+  )
+
   const authMethods: AcpAuthMethod[] = []
   for (const raw of Array.isArray(root.authMethods) ? root.authMethods : []) {
     const m = asRecord(raw)
@@ -91,6 +98,7 @@ export function parseAcpInitializeResult(result: unknown): AcpInitializeResult {
       loadSession: caps.loadSession === true,
       resume,
       promptImage: promptCaps?.image === true,
+      ...(closeSession ? { closeSession: true } : {}),
     },
     authMethods,
     ...(info ? { agentInfo: { name: asString(info.name), version: asString(info.version) } } : {}),
@@ -285,6 +293,20 @@ export function parseAcpCatalog(sessionResult: unknown): AcpCatalogSnapshot {
     ...(currentThoughtLevel ? { currentThoughtLevel } : {}),
     ...(modelOption ? { modelConfigOptionId: modelOption.id } : {}),
     ...(thoughtOption ? { thoughtConfigOptionId: thoughtOption.id } : {}),
+  }
+}
+
+export function extractAcpSessionUpdateMeta(params: unknown): {
+  readonly sessionId?: string
+  readonly updateKind?: string
+} {
+  const root = asRecord(params)
+  const sessionId = asString(root?.sessionId)
+  const update = asRecord(root?.update)
+  const updateKind = asString(update?.sessionUpdate)
+  return {
+    ...(sessionId ? { sessionId } : {}),
+    ...(updateKind ? { updateKind } : {}),
   }
 }
 

@@ -59,6 +59,8 @@ export interface AcpAgentCapabilities {
    */
   readonly resume: 'supported' | 'unsupported' | 'unknown'
   readonly promptImage: boolean
+  /** Agent declares `session/close` in `sessionCapabilities`. */
+  readonly closeSession?: boolean
 }
 
 export interface AcpAuthMethod {
@@ -153,12 +155,30 @@ export interface AcpTurnResult {
 
 export interface AcpStartOptions {
   readonly sessionId?: string
+  /** Optional per-session working directory; defaults to the client's root `cwd`. */
+  readonly cwd?: string
   readonly modelId?: string
   readonly thoughtLevel?: string
   readonly modeId?: string
   readonly authMethodId?: string
   /** Optional ACP `_meta` object forwarded on `session/new`, `session/resume`, and `session/load`. */
   readonly sessionMeta?: Readonly<Record<string, unknown>>
+}
+
+/** Handle to one multiplexed ACP session hosted on a shared `AcpRuntimeClient`. */
+export interface AcpSessionHandle {
+  readonly sessionId: string
+  readonly isOpen: boolean
+  readonly catalog: AcpCatalogSnapshot | undefined
+  setModel(modelId: string): Promise<void>
+  setThoughtLevel(thoughtLevel: string): Promise<void>
+  setMode(modeId: string): Promise<void>
+  runTurn(
+    prompt: readonly AcpPromptBlock[],
+    handlers?: AcpTurnHandlers,
+    signal?: AbortSignal,
+  ): Promise<AcpTurnResult>
+  close(): Promise<void>
 }
 
 export interface AcpTransportFactoryOptions {

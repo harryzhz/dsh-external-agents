@@ -231,6 +231,7 @@ export function createExternalAgentRouter(
         runtimeId && profileId
           ? registry.listModelsForRuntime(runtimeId, profileId)
           : registry.listModelsForProvider(providerId),
+      onExternalBinding: (externalId, sid) => registry.registerExternalSession(externalId, sid),
     })
 
     let detachAgent: (() => void) | undefined

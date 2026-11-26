@@ -56,6 +56,7 @@ export interface ExternalAgentDeps {
     runtimeId?: string,
     profileId?: string,
   ) => Promise<readonly CatalogModelEntry[] | undefined>
+  readonly onExternalBinding?: (externalId: string, sessionId: SessionId) => void
 }
 
 function readPersistedExternalId(session: Session, driver: ExternalDriverKind): string | undefined {
@@ -113,6 +114,7 @@ export class ExternalAgent implements Agent {
     runtimeId?: string,
     profileId?: string,
   ) => Promise<readonly CatalogModelEntry[] | undefined>
+  private readonly onExternalBinding?: (externalId: string, sessionId: SessionId) => void
 
   private lastTurn: number
   private attemptSeq = 0
@@ -137,12 +139,22 @@ export class ExternalAgent implements Agent {
     this.session = deps.session
     this.lastTurn = deps.lastTurn
     this.resolveCatalogModels = deps.resolveCatalogModels
+    this.onExternalBinding = deps.onExternalBinding
 
     this.scope = createScope(this.rootCtx, this)
     this.ctx = this.scope.ctx
     this.dispatch = agentEvents(this.rootCtx, this)
     this.model = new AgentModel(deps.projections.modelSelection, deps.session, deps.options)
     this.inbox = new ExternalAgentInbox(deps.projections.inbox, deps.session, this.dispatch)
+
+    const initialExternalId =
+      readPersistedExternalId(this.session, this.initialRuntime.id) ??
+      (this.initialRuntime.parentRuntimeId
+        ? readPersistedExternalId(this.session, this.initialRuntime.parentRuntimeId)
+        : undefined)
+    if (initialExternalId) {
+      this.onExternalBinding?.(initialExternalId, this.id)
+    }
   }
 
   /** Active external runtime for this session, following blank-session preset switches. */
@@ -386,6 +398,7 @@ export class ExternalAgent implements Agent {
           reason: { kind: 'aborted', reason: this.activeCancelCause },
         })
       } else if (runResult.status === 'failed') {
+        await this.evictDriver()
         this.session.append('turn/end', {
           turn,
           reason: {
@@ -444,6 +457,9 @@ export class ExternalAgent implements Agent {
         ? readPersistedExternalId(this.session, bindingDriverKey)
         : undefined)
     const externalId = await this.driver.ensureConnected(persistedId, model, reasoningEffort)
+    if (externalId) {
+      this.onExternalBinding?.(externalId, this.id)
+    }
     if (externalId && externalId !== persistedId) {
       appendPluginRecord(this.session, EXTERNAL_BINDING_RECORD_TYPE, {
         driver: activeRuntime.id,
