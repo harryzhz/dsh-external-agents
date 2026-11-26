@@ -181,6 +181,10 @@ export class ExternalAgent implements Agent {
 
   cancel(cause: AgentCancelCause, opts?: CancelOptions): void {
     this.activeCancelCause = cause
+    if (cause.kind === 'disposed') {
+      this.disposed = true
+      this.clearIdleTimer()
+    }
     if (!opts?.keepInbox) {
       this.inbox.clear()
     }

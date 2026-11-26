@@ -5,6 +5,7 @@ import {
   effectivePresetOfSession,
   mountWrappedAgentLoop,
   syncBlankSessionModelToPreset,
+  type ManagedExternalAgentRouter,
 } from './agent-loop-bridge.js'
 import { ExternalCatalogLlmAdapter } from './catalog-adapter.js'
 import type { ExternalRuntimeDefinition } from './runtime/definition.js'
@@ -97,7 +98,24 @@ export async function apply(ctx: Context, config: ExternalAgentsConfig): Promise
     catalogTtlMs: config.catalogTtlMs,
     onWarn: (msg) => ctx.logger.warn(msg),
   })
-  ctx.effect(() => () => registry.dispose(), 'dsh-external-agents.runtime-pools')
+  let activeRouter: ManagedExternalAgentRouter | undefined
+  let unregisterFactory: (() => void) | undefined
+  ctx.effect(
+    () => async () => {
+      try {
+        unregisterFactory?.()
+      } catch {
+        // Ignore factory unregister errors during unload.
+      }
+      unregisterFactory = undefined
+      try {
+        await activeRouter?.dispose()
+      } finally {
+        await registry.dispose()
+      }
+    },
+    'dsh-external-agents.lifecycle',
+  )
   const captured = await mountWrappedAgentLoop(ctx, config.maxParallelToolCalls)
 
   for (const runtime of registry.definitions()) {
@@ -210,7 +228,8 @@ export async function apply(ctx: Context, config: ExternalAgentsConfig): Promise
     captured,
     idleEvictMs: config.idleEvictMs,
   })
-  ctx.effect(() => ctx.agents.setFactory(router), 'dsh-external-agents.router')
+  activeRouter = router
+  unregisterFactory = ctx.agents.setFactory(router)
   ctx.on('session/event', (session, event) => {
     const raw = event as { readonly type?: string; readonly data?: { readonly agentPreset?: unknown } }
     if (raw.type !== 'agent-preset/selected') return
