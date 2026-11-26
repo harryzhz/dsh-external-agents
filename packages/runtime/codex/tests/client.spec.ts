@@ -755,4 +755,65 @@ describe('CodexRuntimeClient', () => {
     expect(interrupts).toEqual([{ threadId: 'thr_race', turnId: 'turn_late_id' }])
     await client.close()
   })
+
+  it('ignores notifications and declines server requests belonging to a foreign threadId', async () => {
+    const responses: Array<Record<string, unknown>> = []
+    let transportRef!: MockTransport
+    const transport = new MockTransport((msg, t) => {
+      transportRef = t
+      if (msg.method === 'initialize') {
+        t.emit({ jsonrpc: '2.0', id: msg.id, result: {} })
+      } else if (msg.method === 'thread/start') {
+        t.emit({ jsonrpc: '2.0', id: msg.id, result: { thread: { id: 'thr_alpha' } } })
+      } else if (msg.method === 'turn/start') {
+        t.emit({ jsonrpc: '2.0', id: msg.id, result: { turn: { id: 'turn_alpha_1' } } })
+        // Foreign thread delta & completion MUST be ignored
+        t.emit({
+          jsonrpc: '2.0',
+          method: 'item/agentMessage/delta',
+          params: { threadId: 'thr_foreign', delta: 'LEAKED_FROM_FOREIGN_THREAD' },
+        })
+        t.emit({
+          jsonrpc: '2.0',
+          method: 'turn/completed',
+          params: { threadId: 'thr_foreign', turn: { id: 'turn_foreign', status: 'completed' } },
+        })
+        // Foreign approval request MUST be declined without invoking our turn handler
+        t.emit({
+          jsonrpc: '2.0',
+          id: 999,
+          method: 'item/commandExecution/requestApproval',
+          params: { threadId: 'thr_foreign', command: 'rm -rf /tmp/demo' },
+        })
+        // Own thread delta & completion settle normally
+        t.emit({
+          jsonrpc: '2.0',
+          method: 'item/agentMessage/delta',
+          params: { threadId: 'thr_alpha', delta: 'OWN_REPLY_ONLY' },
+        })
+        t.emit({
+          jsonrpc: '2.0',
+          method: 'turn/completed',
+          params: { threadId: 'thr_alpha', turn: { id: 'turn_alpha_1', status: 'completed' } },
+        })
+      } else if (msg.id === 999) {
+        responses.push(msg as unknown as Record<string, unknown>)
+      }
+    })
+
+    const approvalHandler = vi.fn(async () => 'allow-once' as const)
+    const client = new CodexRuntimeClient({
+      cwd: '/tmp',
+      transportFactory: () => transport,
+    })
+
+    await client.startOrResume()
+    const result = await client.runTurn({ text: 'hello' }, { onApproval: approvalHandler })
+    expect(result.status).toBe('completed')
+    expect(result.text).toBe('OWN_REPLY_ONLY')
+    expect(approvalHandler).not.toHaveBeenCalled()
+    expect(transportRef.sent.find((m) => m.id === 999)?.result).toEqual({ decision: 'decline' })
+    expect(responses).toHaveLength(1)
+    await client.close()
+  })
 })

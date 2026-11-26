@@ -874,6 +874,14 @@ export class AcpRuntimeClient {
     if (sessionId) {
       return this.sessions.get(sessionId)?.activeTurn
     }
+    // Fail-closed in multiplexed connections (> 1 open session): an unlabelled
+    // update or permission request must never be attributed to another session.
+    if (this.sessions.size > 1) {
+      this.logger(
+        `${this.label} dropping unlabelled session event while ${this.sessions.size} sessions are open`,
+      )
+      return undefined
+    }
     let soleTurn: ActiveTurnContext | undefined
     for (const state of this.sessions.values()) {
       if (!state.activeTurn) continue

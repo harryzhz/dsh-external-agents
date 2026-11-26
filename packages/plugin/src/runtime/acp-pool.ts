@@ -300,6 +300,7 @@ export class AcpRuntimePool {
     const env: NodeJS.ProcessEnv = { ...plan.env }
     delete env.DSH_SESSION_ID
     delete env.ANTIGRAVITY_CONVERSATION_ID
+    delete env.ANTIGRAVITY_TRAJECTORY_ID
     let args = [...plan.args]
     let cleanupDir: string | undefined
 
