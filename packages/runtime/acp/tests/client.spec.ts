@@ -364,6 +364,92 @@ describe('AcpRuntimeClient session recovery', () => {
     expect(methodsSent(transport)).toEqual(['initialize', 'session/resume'])
     await client.close()
   })
+
+  it('falls back from session/resume to session/load when resume error suggests session/load', async () => {
+    const transport = recoveryTransport(
+      { loadSession: true, sessionCapabilities: { resume: {} } },
+      {
+        'session/resume': {
+          error: {
+            code: -32603,
+            message: 'Failed to read session acp_legacy; retry, or load it with session/load',
+          },
+        },
+        'session/load': {
+          result: { models: { currentModelId: 'gemini-4-neon', availableModels: [{ modelId: 'gemini-4-neon', name: 'Neon' }] } },
+        },
+      },
+    )
+    const logs: string[] = []
+    const client = new AcpRuntimeClient({
+      cwd: '/repo',
+      command: 'agy',
+      args: ['acp', '--stdio'],
+      logger: (m) => logs.push(m),
+      transportFactory: () => transport,
+    })
+
+    const sid = await client.startOrResume({ sessionId: 'acp_legacy' })
+
+    expect(sid).toBe('acp_legacy')
+    expect(methodsSent(transport)).toEqual(['initialize', 'session/resume', 'session/load'])
+    expect(logs.some((m) => m.includes('session/load'))).toBe(true)
+    await client.close()
+  })
+
+  it('recovers with session/new when session/resume suggests session/load and session/load returns -32002', async () => {
+    const transport = recoveryTransport(
+      { loadSession: true, sessionCapabilities: { resume: {} } },
+      {
+        'session/resume': {
+          error: {
+            code: -32603,
+            message: 'Failed to read session acp_missing; retry, or load it with session/load',
+          },
+        },
+        'session/load': {
+          error: { code: -32002, message: 'Session not found: acp_missing' },
+        },
+        'session/new': {
+          result: { sessionId: 'acp_fresh_after_load_404' },
+        },
+      },
+    )
+    const client = new AcpRuntimeClient({
+      cwd: '/repo',
+      command: 'agy',
+      args: ['acp', '--stdio'],
+      transportFactory: () => transport,
+    })
+
+    const sid = await client.startOrResume({ sessionId: 'acp_missing' })
+
+    expect(sid).toBe('acp_fresh_after_load_404')
+    expect(methodsSent(transport)).toEqual(['initialize', 'session/resume', 'session/load', 'session/new'])
+    await client.close()
+  })
+
+  it('propagates session/resume load-fallback hint error when loadSession capability is false', async () => {
+    const transport = recoveryTransport(
+      { loadSession: false, sessionCapabilities: { resume: {} } },
+      {
+        'session/resume': {
+          error: {
+            code: -32603,
+            message: 'Failed to read session acp_old; retry, or load it with session/load',
+          },
+        },
+      },
+    )
+    const client = new AcpRuntimeClient({ cwd: '/repo', command: 'agy', args: [], transportFactory: () => transport })
+
+    const err = await client.startOrResume({ sessionId: 'acp_old' }).catch((e: unknown) => e)
+
+    expect(err).toBeInstanceOf(AcpRpcError)
+    expect(err).toMatchObject({ code: -32603, method: 'session/resume' })
+    expect(methodsSent(transport)).toEqual(['initialize', 'session/resume'])
+    await client.close()
+  })
 })
 
 describe('AcpRuntimeClient model config options', () => {

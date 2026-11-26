@@ -1,5 +1,18 @@
 import { createHash, randomBytes } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import {
+  chmodSync,
+  copyFileSync,
+  cpSync,
+  existsSync,
+  linkSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs'
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 import {
@@ -16,6 +29,7 @@ import { resolveRuntimeLaunchPlan, type ResolvedRuntimeLaunchPlan } from './prof
 const DEFAULT_POOL_IDLE_EVICT_MS = 15 * 60_000
 const AGY_DATA_DIR_FLAGS = new Set(['--app-data-dir', '--app_data_dir', '--gemini-dir', '--gemini_dir'])
 const EXECUTOR_ERROR_BANNER_RE = /^⚠\s*agent executor error:\s*([^\r\n]+)$/u
+const SAFE_AGY_SESSION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
 
 /**
  * Detect fatal Antigravity ACP executor errors that upstream emits as plain
@@ -99,6 +113,130 @@ export function syncAgyBaseSettings(geminiDir: string, appDataDirName: string): 
   }
 }
 
+function isRegularFile(filePath: string): boolean {
+  try {
+    return statSync(filePath).isFile()
+  } catch {
+    return false
+  }
+}
+
+function isDirectory(dirPath: string): boolean {
+  try {
+    return statSync(dirPath).isDirectory()
+  } catch {
+    return false
+  }
+}
+
+function copyFileAtomicallyIfMissing(srcPath: string, dstPath: string, mode?: number): boolean {
+  if (existsSync(dstPath) || !isRegularFile(srcPath)) return false
+  const tmpPath = `${dstPath}.tmp-${process.pid}-${randomBytes(4).toString('hex')}`
+  try {
+    copyFileSync(srcPath, tmpPath)
+    if (mode !== undefined) {
+      chmodSync(tmpPath, mode)
+    }
+    try {
+      linkSync(tmpPath, dstPath)
+      unlinkSync(tmpPath)
+      return true
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code
+      if (code === 'EEXIST') {
+        rmSync(tmpPath, { force: true })
+        return false
+      }
+      if (!existsSync(dstPath)) {
+        renameSync(tmpPath, dstPath)
+        return true
+      }
+      rmSync(tmpPath, { force: true })
+      return false
+    }
+  } catch (err) {
+    rmSync(tmpPath, { force: true })
+    throw err
+  }
+}
+
+function copyDirectoryIfMissing(srcDir: string, dstDir: string): void {
+  if (existsSync(dstDir) || !isDirectory(srcDir)) return
+  const tmpDir = `${dstDir}.tmp-${process.pid}-${randomBytes(4).toString('hex')}`
+  try {
+    cpSync(srcDir, tmpDir, { recursive: true, force: false, errorOnExist: true, verbatimSymlinks: true })
+    if (existsSync(dstDir)) {
+      rmSync(tmpDir, { recursive: true, force: true })
+      return
+    }
+    renameSync(tmpDir, dstDir)
+  } catch (err) {
+    rmSync(tmpDir, { recursive: true, force: true })
+    const code = (err as NodeJS.ErrnoException).code
+    if (code === 'EEXIST' || code === 'ENOTEMPTY') return
+    throw err
+  }
+}
+
+/**
+ * Copy a single legacy Antigravity session from `~/.gemini/antigravity-cli/`
+ * into an isolated pool `appDataDir` on demand when resuming a pre-isolation
+ * session. Leaves host originals untouched, skips active WAL-locked DBs, and
+ * never overwrites an existing session in the target pool directory.
+ */
+export function migrateLegacyAgySession(
+  geminiDir: string,
+  appDataDirName: string,
+  sessionId: string,
+  logger?: (message: string) => void,
+): boolean {
+  const cleanId = sessionId.trim()
+  if (!SAFE_AGY_SESSION_ID_RE.test(cleanId) || cleanId.includes('..')) return false
+
+  const legacyDir = resolve(geminiDir, 'antigravity-cli')
+  const targetDir = resolve(geminiDir, appDataDirName)
+  if (legacyDir === targetDir) return false
+
+  const srcDb = join(legacyDir, 'conversations', `${cleanId}.db`)
+  const dstDb = join(targetDir, 'conversations', `${cleanId}.db`)
+  if (existsSync(dstDb) || !isRegularFile(srcDb)) return false
+
+  if (existsSync(`${srcDb}-wal`) || existsSync(`${srcDb}-shm`)) {
+    logger?.(
+      `agy pool skipped migrating legacy session ${cleanId}: source database has active WAL/SHM files`,
+    )
+    return false
+  }
+
+  try {
+    mkdirSync(join(targetDir, 'conversations'), { recursive: true })
+    const copiedDb = copyFileAtomicallyIfMissing(srcDb, dstDb, 0o600)
+    if (!copiedDb) return false
+
+    const srcAnnotation = join(legacyDir, 'annotations', `${cleanId}.pbtxt`)
+    const dstAnnotation = join(targetDir, 'annotations', `${cleanId}.pbtxt`)
+    if (isRegularFile(srcAnnotation) && !existsSync(dstAnnotation)) {
+      mkdirSync(join(targetDir, 'annotations'), { recursive: true })
+      copyFileAtomicallyIfMissing(srcAnnotation, dstAnnotation)
+    }
+
+    const srcBrain = join(legacyDir, 'brain', cleanId)
+    const dstBrain = join(targetDir, 'brain', cleanId)
+    if (isDirectory(srcBrain) && !existsSync(dstBrain)) {
+      mkdirSync(join(targetDir, 'brain'), { recursive: true })
+      copyDirectoryIfMissing(srcBrain, dstBrain)
+    }
+
+    logger?.(`agy pool migrated legacy session ${cleanId} into isolated app-data-dir ${appDataDirName}`)
+    return true
+  } catch (err) {
+    logger?.(
+      `agy pool failed to migrate legacy session ${cleanId}: ${err instanceof Error ? err.message : String(err)}`,
+    )
+    return false
+  }
+}
+
 export function resolveDefaultInstanceScopeKey(dataDir?: string, env: NodeJS.ProcessEnv = process.env): string {
   const explicit = dataDir?.trim()
   if (explicit) return resolve(explicit)
@@ -128,9 +266,15 @@ export interface AcpRuntimePoolOptions {
   readonly probeCatalogFn?: (options: AcpRuntimeOptions) => Promise<AcpCatalogSnapshot>
 }
 
+interface AgyIsolationTarget {
+  readonly geminiDir: string
+  readonly appDataDirName: string
+}
+
 interface PoolEntry {
   readonly key: string
   client: AcpPoolClientLike
+  readonly agyIsolation?: AgyIsolationTarget
   idleTimer?: ReturnType<typeof setTimeout>
   retired: boolean
   closing?: Promise<void>
@@ -179,6 +323,15 @@ export class AcpRuntimePool {
     const key = poolKeyFor(this.spec.id, profile?.id)
     const entry = await this.acquireEntry(key, profile, logger)
     this.clearIdleTimer(entry)
+
+    if (entry.agyIsolation && startOptions.sessionId) {
+      migrateLegacyAgySession(
+        entry.agyIsolation.geminiDir,
+        entry.agyIsolation.appDataDirName,
+        startOptions.sessionId,
+        logger ?? this.logger,
+      )
+    }
 
     try {
       const handle = await entry.client.openSession(startOptions)
@@ -274,12 +427,17 @@ export class AcpRuntimePool {
       await this.closeEntry(existing)
     }
 
-    const { runtimeOptions } = this.buildRuntimeOptions(profile, {
+    const { runtimeOptions, agyIsolation } = this.buildRuntimeOptions(profile, {
       isProbe: false,
       logger,
     })
     const client = this.clientFactory(runtimeOptions)
-    const entry: PoolEntry = { key, client, retired: false }
+    const entry: PoolEntry = {
+      key,
+      client,
+      ...(agyIsolation ? { agyIsolation } : {}),
+      retired: false,
+    }
     this.entries.set(key, entry)
     return entry
   }
@@ -291,7 +449,11 @@ export class AcpRuntimePool {
       readonly isProbe: boolean
       readonly logger?: (message: string) => void
     },
-  ): { readonly runtimeOptions: AcpRuntimeOptions; readonly cleanupDir?: string } {
+  ): {
+    readonly runtimeOptions: AcpRuntimeOptions
+    readonly cleanupDir?: string
+    readonly agyIsolation?: AgyIsolationTarget
+  } {
     const extraEnv: Record<string, string> = opts.isProbe ? {} : { DSH_IN_AGENT_SESSION: '1' }
     const plan: ResolvedRuntimeLaunchPlan = resolveRuntimeLaunchPlan(this.spec, profile, extraEnv)
     // Never leak a host/parent DSH_SESSION_ID or ANTIGRAVITY_CONVERSATION_ID into a shared
@@ -303,6 +465,7 @@ export class AcpRuntimePool {
     delete env.ANTIGRAVITY_TRAJECTORY_ID
     let args = [...plan.args]
     let cleanupDir: string | undefined
+    let agyIsolation: AgyIsolationTarget | undefined
 
     if (this.spec.id === 'agy' && !hasAgyDataDirFlag(args)) {
       const appDataDirName = buildAgyIsolatedAppDataDirName(
@@ -315,6 +478,8 @@ export class AcpRuntimePool {
       args = [...args, '--app-data-dir', appDataDirName]
       if (opts.ephemeralTag) {
         cleanupDir = join(geminiDir, appDataDirName)
+      } else {
+        agyIsolation = { geminiDir, appDataDirName }
       }
     }
 
@@ -327,7 +492,11 @@ export class AcpRuntimePool {
       ...(plan.sessionMeta ? { sessionMeta: plan.sessionMeta } : {}),
       logger: opts.logger ?? this.logger,
     }
-    return { runtimeOptions, ...(cleanupDir ? { cleanupDir } : {}) }
+    return {
+      runtimeOptions,
+      ...(cleanupDir ? { cleanupDir } : {}),
+      ...(agyIsolation ? { agyIsolation } : {}),
+    }
   }
 
   private onSessionReleased(entry: PoolEntry): void {

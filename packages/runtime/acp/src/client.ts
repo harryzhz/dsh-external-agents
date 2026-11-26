@@ -1,4 +1,10 @@
-import { AcpRpcError, isAuthRequired, isMethodNotFound, isResourceNotFound } from './errors.js'
+import {
+  AcpRpcError,
+  isAuthRequired,
+  isMethodNotFound,
+  isResourceNotFound,
+  isResumeLoadFallbackHint,
+} from './errors.js'
 import {
   extractAcpPromptUsage,
   extractAcpSessionUpdateMeta,
@@ -589,8 +595,13 @@ export class AcpRuntimeClient {
         try {
           return { sessionId, result: await this.request('session/resume', params) }
         } catch (err) {
-          if (!isMethodNotFound(err)) throw err
-          this.logger(`${this.label} does not implement session/resume; trying fallback`)
+          if (isMethodNotFound(err)) {
+            this.logger(`${this.label} does not implement session/resume; trying fallback`)
+          } else if (capabilities.loadSession && isResumeLoadFallbackHint(err)) {
+            this.logger(`${this.label} session/resume suggested session/load fallback; trying session/load`)
+          } else {
+            throw err
+          }
         }
       }
       if (capabilities.loadSession) {
