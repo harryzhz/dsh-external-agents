@@ -39,7 +39,21 @@ flowchart LR
 
 ## 安装与使用
 
-### 方式一：DSH 界面安装（Desktop / Web）
+### 方式一：一键安装全套（自动检测并安装 DSH + 双插件，推荐）
+
+如需一步自动检测并安装 **DeepSeek Harness（Desktop App 或 Web 版）**、**`dsh-external-agents`** 以及配套飞书桥接插件 **`dsh-lark-bridge`**，可直接运行统一一键安装脚本（支持 `--mode app` / `--mode web` / `--mode both`，详细参数见 [dsh-lark-bridge 安装文档](https://github.com/harryzhz/dsh-lark-bridge#2-%E5%AE%89%E8%A3%85%E4%B8%8E%E4%BD%BF%E7%94%A8)）：
+
+```bash
+# macOS / Linux（交互选择 Desktop App / Web / 两版都装，或追加 -s -- --mode web|app|both）
+curl -fsSL https://raw.githubusercontent.com/harryzhz/dsh-lark-bridge/main/scripts/install.sh | bash
+```
+
+```powershell
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/harryzhz/dsh-lark-bridge/main/scripts/install.ps1 | iex
+```
+
+### 方式二：DSH 界面安装（Desktop / Web）
 
 1. 打开侧边栏 **插件 → 添加插件**。
 2. 填入任一安装源并点击 **安装**：
@@ -48,7 +62,7 @@ flowchart LR
    - **本地源码目录**：先在仓库运行 `pnpm install && pnpm build`，再填入绝对路径
 3. 点击 **立即启用**，并 **重启一次 DSH** 让外部运行时生效。
 
-### 方式二：`dsh plugin` CLI 安装（Web / Headless / SDK / ACP）
+### 方式三：`dsh plugin` CLI 安装（Web / Headless / SDK / ACP）
 
 > `--profile <name>` 须写在 `add` / `remove` 之前。`desktop` profile 由桌面端托管，请使用上方界面安装。
 
