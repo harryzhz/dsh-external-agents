@@ -36,6 +36,7 @@ import {
   buildAgyIsolatedAppDataDirName,
   detectAcpExecutorError,
   hasAgyDataDirFlag,
+  migrateLegacyAgySession,
   syncAgyBaseSettings,
   type AcpPoolClientLike,
 } from '../src/runtime/acp-pool.js'
@@ -221,6 +222,48 @@ describe('agy isolation helpers & executor error detection', () => {
     expect(readFileSync(join(hostDir, 'settings.json'), 'utf8')).toBe(content)
   })
 
+  it('migrates legacy agy session artifacts on demand, preserves host originals, skips WAL-locked DBs, and rejects unsafe IDs', () => {
+    const fakeGemini = makeTempDir('fake-gemini-migrate-')
+    const legacyDir = join(fakeGemini, 'antigravity-cli')
+    const targetName = 'dsh-agy-12345678-default'
+    const targetDir = join(fakeGemini, targetName)
+    const sid = '11111111-2222-3333-4444-555555555555'
+
+    mkdirSync(join(legacyDir, 'conversations'), { recursive: true })
+    mkdirSync(join(legacyDir, 'annotations'), { recursive: true })
+    mkdirSync(join(legacyDir, 'brain', sid, 'scratch'), { recursive: true })
+    writeFileSync(join(legacyDir, 'conversations', `${sid}.db`), 'legacy-sqlite-bytes')
+    writeFileSync(join(legacyDir, 'annotations', `${sid}.pbtxt`), 'title: "Demo"')
+    writeFileSync(join(legacyDir, 'brain', sid, 'scratch', 'note.txt'), 'kept')
+
+    const logs: string[] = []
+    expect(migrateLegacyAgySession(fakeGemini, targetName, sid, (m) => logs.push(m))).toBe(true)
+    expect(readFileSync(join(targetDir, 'conversations', `${sid}.db`), 'utf8')).toBe('legacy-sqlite-bytes')
+    expect(readFileSync(join(targetDir, 'annotations', `${sid}.pbtxt`), 'utf8')).toBe('title: "Demo"')
+    expect(readFileSync(join(targetDir, 'brain', sid, 'scratch', 'note.txt'), 'utf8')).toBe('kept')
+    expect(readFileSync(join(legacyDir, 'conversations', `${sid}.db`), 'utf8')).toBe('legacy-sqlite-bytes')
+    expect(logs.some((m) => m.includes('migrated legacy session'))).toBe(true)
+
+    // Idempotent: never overwrites existing session DB in target isolated directory
+    writeFileSync(join(targetDir, 'conversations', `${sid}.db`), 'newer-pool-bytes')
+    expect(migrateLegacyAgySession(fakeGemini, targetName, sid)).toBe(false)
+    expect(readFileSync(join(targetDir, 'conversations', `${sid}.db`), 'utf8')).toBe('newer-pool-bytes')
+
+    // Skips migration when legacy DB has active WAL/SHM files
+    const walSid = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+    writeFileSync(join(legacyDir, 'conversations', `${walSid}.db`), 'wal-db')
+    writeFileSync(join(legacyDir, 'conversations', `${walSid}.db-wal`), 'pending-frames')
+    const walLogs: string[] = []
+    expect(migrateLegacyAgySession(fakeGemini, targetName, walSid, (m) => walLogs.push(m))).toBe(false)
+    expect(existsSync(join(targetDir, 'conversations', `${walSid}.db`))).toBe(false)
+    expect(walLogs.some((m) => m.includes('active WAL/SHM'))).toBe(true)
+
+    // Rejects unsafe / traversal IDs
+    expect(migrateLegacyAgySession(fakeGemini, targetName, '../escape')).toBe(false)
+    expect(migrateLegacyAgySession(fakeGemini, targetName, 'foo/bar')).toBe(false)
+    expect(migrateLegacyAgySession(fakeGemini, targetName, 'a..b')).toBe(false)
+  })
+
   it('detects standalone agy executor error banners without false-positiving on multi-line explanations', () => {
     expect(
       detectAcpExecutorError(
@@ -292,6 +335,44 @@ describe('AcpRuntimePool isolation, multiplexing, probe reuse, and lifecycle', (
     await pool.disposeAll()
     expect(createdClients[0]!.closed).toBe(true)
     expect(createdClients[1]!.closed).toBe(true)
+  })
+
+  it('migrates legacy agy session into isolated pool dir right before resuming on a live pooled client', async () => {
+    const fakeHome = makeTempDir('agy-live-migrate-home-')
+    const legacySid = '12345678-1234-4234-8234-1234567890ab'
+    const legacyDir = join(fakeHome, '.gemini', 'antigravity-cli')
+    mkdirSync(join(legacyDir, 'conversations'), { recursive: true })
+    writeFileSync(join(legacyDir, 'conversations', `${legacySid}.db`), 'legacy-conversation-data')
+
+    const agySpec = resolveRuntimeSpecs([{ id: 'agy', env: { HOME: fakeHome } }]).find((s) => s.id === 'agy')!
+    let dbPresentAtOpenTime = false
+    const pool = new AcpRuntimePool({
+      spec: agySpec,
+      instanceScopeKey: '/tmp/dsh-live-migrate/external-agents',
+      clientFactory: (opts) => {
+        const dirName = opts.args[opts.args.indexOf('--app-data-dir') + 1]!
+        const base = new FakePoolClient(opts)
+        const origOpen = base.openSession.bind(base)
+        base.openSession = async (startOpts = {}) => {
+          if (startOpts.sessionId === legacySid) {
+            dbPresentAtOpenTime = existsSync(join(fakeHome, '.gemini', dirName, 'conversations', `${legacySid}.db`))
+          }
+          return await origOpen(startOpts)
+        }
+        return base
+      },
+    })
+
+    // First start an unrelated new session so the pool process is already running
+    const fresh = await pool.openSession(undefined, { cwd: '/workspace/a' })
+    // Now resume a legacy session on the same running pool client
+    const resumed = await pool.openSession(undefined, { cwd: '/workspace/a', sessionId: legacySid })
+    expect(dbPresentAtOpenTime).toBe(true)
+    expect(resumed.handle.sessionId).toBe(legacySid)
+
+    await fresh.release()
+    await resumed.release()
+    await pool.disposeAll()
   })
 
   it('reuses live pool catalog for probeCatalog and isolates + cleans up cold probes', async () => {

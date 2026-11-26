@@ -11,6 +11,7 @@ export {
   isAuthRequired,
   isMethodNotFound,
   isResourceNotFound,
+  isResumeLoadFallbackHint,
 } from './errors.js'
 export {
   extractAcpPromptUsage,
