@@ -110,10 +110,37 @@ export async function mountWrappedAgentLoop(
   return { nativeFactory, modelProjection, inboxProjection }
 }
 
+const DEFAULT_TEARDOWN_IDLE_GRACE_MS = 6_000
+
 export interface ExternalAgentRouterOptions {
   readonly registry: ExternalRuntimeRegistry
   readonly captured: CapturedAgentLoop
   readonly idleEvictMs: number
+  readonly teardownIdleGraceMs?: number
+}
+
+export interface ManagedExternalAgentRouter extends AgentFactory {
+  /** Stop accepting new external agents and tear down every live external agent created by this router. */
+  dispose(): Promise<void>
+}
+
+async function waitWithTimeout(task: Promise<void>, timeoutMs: number): Promise<'settled' | 'timeout'> {
+  if (timeoutMs <= 0) {
+    await task
+    return 'settled'
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      task.then(() => 'settled' as const),
+      new Promise<'timeout'>((resolve) => {
+        timer = setTimeout(() => resolve('timeout'), timeoutMs)
+        timer.unref?.()
+      }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
 }
 
 /**
@@ -201,8 +228,26 @@ export async function syncBlankSessionModelToPreset(
 /** Route presets owned by a registered external runtime; everything else goes to native AgentLoop. */
 export function createExternalAgentRouter(
   ctx: Context,
-  { registry, captured, idleEvictMs }: ExternalAgentRouterOptions,
-): AgentFactory {
+  {
+    registry,
+    captured,
+    idleEvictMs,
+    teardownIdleGraceMs = DEFAULT_TEARDOWN_IDLE_GRACE_MS,
+  }: ExternalAgentRouterOptions,
+): ManagedExternalAgentRouter {
+  let active = true
+  const liveDisposers = new Set<() => Promise<void>>()
+  const inFlightOps = new Set<Promise<unknown>>()
+
+  const trackOp = <T>(op: Promise<T>): Promise<T> => {
+    inFlightOps.add(op)
+    const cleanup = () => {
+      inFlightOps.delete(op)
+    }
+    op.then(cleanup, cleanup)
+    return op
+  }
+
   async function attachExternal(
     ownerCtx: Context,
     runtime: ExternalRuntimeDefinition,
@@ -212,6 +257,11 @@ export function createExternalAgentRouter(
     stored: { readonly handle: SessionHandle } | undefined,
     setup: CreateAgentOptions['setup'],
   ): Promise<AgentHandle> {
+    if (!active) {
+      await stored?.handle.close().catch(() => {})
+      throw new Error(`external agent "${session.id}" creation aborted: router is not active`)
+    }
+
     const lastTurn = ctx.agents.turnBoundaryOf(session).lastTurn
     const agent = new ExternalAgent({
       rootCtx: ctx,
@@ -238,46 +288,122 @@ export function createExternalAgentRouter(
     const detachSession = agent.ctx.sessions.enter(session)
     agent.ctx.sessions.announce(session)
 
-    let disposing: Promise<void> | undefined
-    const teardown = (): Promise<void> =>
-      (disposing ??= (async () => {
-        agent.cancel({ kind: 'disposed' })
-        await agent.whenIdle()
-        await agent.disposeExternal()
-        await agent.scope.dispose()
-        await stored?.handle.close()
-        detachAgent?.()
-        detachSession()
-      })())
+    let setupDone = false
+    let releaseSetup!: () => void
+    const setupSettled = new Promise<void>((resolve) => {
+      releaseSetup = resolve
+    })
+    const markSetupDone = () => {
+      if (setupDone) return
+      setupDone = true
+      releaseSetup()
+    }
 
-    const unfollowOwner = ownerCtx.effect(() => () => teardown(), `externalAgent.lifecycle(${session.id})`)
+    let teardownRequested = false
+    let disposing: Promise<void> | undefined
+    let untrack: () => void = () => {}
+
+    const teardown = (): Promise<void> => {
+      teardownRequested = true
+      return (disposing ??= (async () => {
+        await setupSettled
+        let idleOutcome: 'settled' | 'timeout' = 'settled'
+        try {
+          agent.cancel({ kind: 'disposed' })
+          idleOutcome = await waitWithTimeout(agent.whenIdle(), teardownIdleGraceMs)
+        } catch {
+          // Best-effort cancellation drain; always continue cleanup.
+        }
+        try {
+          await agent.disposeExternal()
+        } catch {
+          // Ignore driver close errors during teardown.
+        }
+        if (idleOutcome === 'timeout') {
+          try {
+            await waitWithTimeout(agent.whenIdle(), Math.min(teardownIdleGraceMs, 1_000))
+          } catch {
+            // Ignore post-force-close idle errors.
+          }
+        }
+        try {
+          await agent.scope.dispose()
+        } catch {
+          // Ignore scope disposal errors during teardown.
+        }
+        try {
+          await stored?.handle.close()
+        } catch {
+          // Ignore persistence handle close errors during teardown.
+        }
+        try {
+          detachAgent?.()
+        } catch {
+          // Ignore agent detach errors during teardown.
+        }
+        try {
+          detachSession()
+        } catch {
+          // Ignore session detach errors during teardown.
+        }
+        untrack()
+      })())
+    }
+
+    let unfollowOwner: (() => unknown) | undefined
+    const dispose = async (): Promise<void> => {
+      try {
+        await teardown()
+      } finally {
+        untrack()
+        const releaseOwner = unfollowOwner
+        unfollowOwner = undefined
+        if (releaseOwner) {
+          await Promise.resolve(releaseOwner()).catch(() => {})
+        }
+      }
+    }
+
+    liveDisposers.add(dispose)
+    untrack = () => {
+      liveDisposers.delete(dispose)
+    }
 
     try {
+      unfollowOwner = ownerCtx.effect(
+        () => () => teardown(),
+        `externalAgent.lifecycle(${session.id})`,
+      )
+      if (!active || teardownRequested) {
+        throw new Error(`external agent "${session.id}" setup aborted: disposed during setup`)
+      }
       const commit = await setup?.(agent.ctx, agent)
+      if (!active || teardownRequested) {
+        throw new Error(`external agent "${session.id}" setup aborted: disposed during setup`)
+      }
       commit?.commit()
       detachAgent = ctx.agents.enter(agent)
       await ctx.agents.announce(agent, source)
+      if (!active || teardownRequested) {
+        throw new Error(`external agent "${session.id}" setup aborted: disposed during announce`)
+      }
+      markSetupDone()
       if (source === 'startup' && lastTurn === 0) {
         const presetId = effectivePresetOfSession(session.header, session.snapshotEvents())
         queueMicrotask(() => {
+          if (!active || teardownRequested) return
           void syncBlankSessionModelToPreset(ctx, registry, session.id, presetId).catch(() => {})
         })
       }
     } catch (err) {
-      await teardown().catch(() => {})
-      await unfollowOwner()
+      markSetupDone()
+      await dispose().catch(() => {})
       throw err
     }
 
     return {
       agent,
-      async dispose() {
-        try {
-          await teardown()
-        } finally {
-          await unfollowOwner()
-        }
-      },
+      dispose,
     }
   }
 
@@ -287,42 +413,54 @@ export function createExternalAgentRouter(
       if (!runtime) {
         return await captured.nativeFactory.createAgent(ownerCtx, options)
       }
-
-      const preparation = SessionPreparation.create(
-        ctx.sessions.prepare(options.sessionId, {
-          ...(options.seed === undefined ? {} : { seed: options.seed }),
-          ...(options.meta === undefined ? {} : { meta: options.meta }),
-          ...(options.inheritedEventCount === undefined
-            ? {}
-            : { inheritedEventCount: options.inheritedEventCount }),
-        }),
-      )
-      const persistence = ctx.get('sessionPersistence')
-      let stored: { readonly handle: SessionHandle } | undefined
-      try {
-        if (persistence) {
-          const handle = await persistence.create(preparation.session.header, {
-            inheritedEventCount: preparation.session.inheritedEventCount,
-          })
-          stored = { handle }
-          const suffix = preparation.session.snapshotEvents(SessionLogOffset(0))
-          if (suffix.length > 0) await handle.append(suffix)
-        }
-        return await attachExternal(
-          ownerCtx,
-          runtime,
-          preparation.session,
-          options.agentOptions ?? {},
-          'startup',
-          stored,
-          options.setup,
-        )
-      } catch (err) {
-        await stored?.handle.close().catch(() => {})
-        throw err
-      } finally {
-        preparation[Symbol.dispose]()
+      if (!active) {
+        throw new Error(`external agent "${options.sessionId}" creation aborted: router is not active`)
       }
+
+      return await trackOp(
+        (async () => {
+          const preparation = SessionPreparation.create(
+            ctx.sessions.prepare(options.sessionId, {
+              ...(options.seed === undefined ? {} : { seed: options.seed }),
+              ...(options.meta === undefined ? {} : { meta: options.meta }),
+              ...(options.inheritedEventCount === undefined
+                ? {}
+                : { inheritedEventCount: options.inheritedEventCount }),
+            }),
+          )
+          const persistence = ctx.get('sessionPersistence')
+          let stored: { readonly handle: SessionHandle } | undefined
+          try {
+            if (persistence) {
+              const handle = await persistence.create(preparation.session.header, {
+                inheritedEventCount: preparation.session.inheritedEventCount,
+              })
+              stored = { handle }
+              if (!active) {
+                throw new Error(
+                  `external agent "${options.sessionId}" creation aborted: router is not active`,
+                )
+              }
+              const suffix = preparation.session.snapshotEvents(SessionLogOffset(0))
+              if (suffix.length > 0) await handle.append(suffix)
+            }
+            return await attachExternal(
+              ownerCtx,
+              runtime,
+              preparation.session,
+              options.agentOptions ?? {},
+              'startup',
+              stored,
+              options.setup,
+            )
+          } catch (err) {
+            await stored?.handle.close().catch(() => {})
+            throw err
+          } finally {
+            preparation[Symbol.dispose]()
+          }
+        })(),
+      )
     },
 
     async resume(ownerCtx: Context, options: ResumeAgentOptions): Promise<AgentHandle> {
@@ -330,50 +468,79 @@ export function createExternalAgentRouter(
       if (!persistence) {
         return await captured.nativeFactory.resume(ownerCtx, options)
       }
+      if (!active) {
+        throw new Error(
+          `external agent "${options.resumeSessionId}" resume aborted: router is not active`,
+        )
+      }
 
-      const handle = await persistence.open(options.resumeSessionId, 'write')
-      let handedOff = false
-      let preparation: SessionPreparation | undefined
-      try {
-        const coldRead = await handle.read(0, undefined)
-        const effectivePreset = effectivePresetOfSession(handle.header, coldRead.events)
-        const runtime = registry.resolve(effectivePreset)
-        if (!runtime) {
-          await handle.close()
-          handedOff = true
-          return await captured.nativeFactory.resume(ownerCtx, options)
-        }
-        const closers = interruptedTurnClosers(coldRead.events)
-        if (closers.length > 0) await handle.append(closers)
-        preparation = SessionPreparation.create(
-          ctx.sessions.prepare(options.resumeSessionId, {
-            seed: [...coldRead.events, ...closers],
-            meta: structuredClone(handle.header),
-            inheritedEventCount: handle.inheritedEventCount,
-            eventState: coldRead.eventState,
-          }),
-        )
-        const storedCount = coldRead.events.length + closers.length
-        const unstoredSuffix = preparation.session.snapshotEvents(SessionLogOffset(storedCount))
-        if (unstoredSuffix.length > 0) {
-          await handle.append(unstoredSuffix)
-        }
-        const result = await attachExternal(
-          ownerCtx,
-          runtime,
-          preparation.session,
-          options.agentOptions ?? {},
-          'resume',
-          { handle },
-          options.setup,
-        )
-        handedOff = true
-        return result
-      } finally {
-        preparation?.[Symbol.dispose]()
-        if (!handedOff) {
-          await handle.close().catch(() => {})
-        }
+      return await trackOp(
+        (async () => {
+          const handle = await persistence.open(options.resumeSessionId, 'write')
+          let handedOff = false
+          let preparation: SessionPreparation | undefined
+          try {
+            const coldRead = await handle.read(0, undefined)
+            const effectivePreset = effectivePresetOfSession(handle.header, coldRead.events)
+            const runtime = registry.resolve(effectivePreset)
+            if (!runtime) {
+              await handle.close()
+              handedOff = true
+              return await captured.nativeFactory.resume(ownerCtx, options)
+            }
+            if (!active) {
+              throw new Error(
+                `external agent "${options.resumeSessionId}" resume aborted: router is not active`,
+              )
+            }
+            const closers = interruptedTurnClosers(coldRead.events)
+            if (closers.length > 0) await handle.append(closers)
+            preparation = SessionPreparation.create(
+              ctx.sessions.prepare(options.resumeSessionId, {
+                seed: [...coldRead.events, ...closers],
+                meta: structuredClone(handle.header),
+                inheritedEventCount: handle.inheritedEventCount,
+                eventState: coldRead.eventState,
+              }),
+            )
+            const storedCount = coldRead.events.length + closers.length
+            const unstoredSuffix = preparation.session.snapshotEvents(SessionLogOffset(storedCount))
+            if (unstoredSuffix.length > 0) {
+              await handle.append(unstoredSuffix)
+            }
+            const result = await attachExternal(
+              ownerCtx,
+              runtime,
+              preparation.session,
+              options.agentOptions ?? {},
+              'resume',
+              { handle },
+              options.setup,
+            )
+            handedOff = true
+            return result
+          } finally {
+            preparation?.[Symbol.dispose]()
+            if (!handedOff) {
+              await handle.close().catch(() => {})
+            }
+          }
+        })(),
+      )
+    },
+
+    async dispose(): Promise<void> {
+      active = false
+      const firstPass = [...liveDisposers]
+      if (firstPass.length > 0) {
+        await Promise.allSettled(firstPass.map((fn) => fn()))
+      }
+      if (inFlightOps.size > 0) {
+        await Promise.allSettled([...inFlightOps])
+      }
+      if (liveDisposers.size > 0) {
+        const remainder = [...liveDisposers]
+        await Promise.allSettled(remainder.map((fn) => fn()))
       }
     },
   }
