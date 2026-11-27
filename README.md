@@ -1,6 +1,17 @@
-# dsh-external-agents
+<div align="center">
+  <h1>dsh-external-agents</h1>
+  <p><strong>在 DeepSeek Harness (Desktop & Web) 中直接运行 Claude Code、Codex、Antigravity 与 TRAE CLI — 零侵入外部 Agent 运行时插件</strong></p>
+  <p>
+    <a href="https://github.com/harryzhz/dsh-external-agents/releases/latest"><img src="https://img.shields.io/github/v/release/harryzhz/dsh-external-agents?style=flat-square&color=0ea5e9" alt="Latest Release" /></a>
+    <a href="./LICENSE"><img src="https://img.shields.io/github/license/harryzhz/dsh-external-agents?style=flat-square&color=10b981" alt="License: MIT" /></a>
+    <a href="https://github.com/harryzhz/dsh-external-agents/stargazers"><img src="https://img.shields.io/github/stars/harryzhz/dsh-external-agents?style=flat-square&color=f59e0b" alt="GitHub Stars" /></a>
+  </p>
+  <p>
+    <strong>简体中文</strong> · <a href="./README_EN.md">English</a>
+  </p>
+</div>
 
-为 [DeepSeek Harness (DSH)](https://github.com/deepseek-ai/deepseek-harness) Desktop 与 Web 提供可插拔的外部 CLI Agent 运行时：**Codex**、**Antigravity**、**Claude Code**、**TRAE CLI (`traecli`)**，以及自定义 `codex-app-server` / ACP 协议 CLI。
+为 [DeepSeek Harness (DSH)](https://github.com/deepseek-ai/deepseek-harness) Desktop 与 Web 提供可插拔的外部 CLI Agent 运行时：**Codex**、**Antigravity**、**Claude Code**、**TRAE CLI (`traecli`)**，以及自定义 `codex-app-server` / ACP 协议 CLI。搭配 [harryzhz/dsh-lark-bridge](https://github.com/harryzhz/dsh-lark-bridge) 后，可直接把这些本地 Coding Agent 变成 24 小时在线的飞书群研发同事。
 
 ## 特性
 
