@@ -7,8 +7,11 @@
 ```mermaid
 flowchart LR
     subgraph Protocol["纯协议传输层（零 DSH 依赖）"]
+        Shared["packages/runtime/shared-stdio\n共享 JSON-RPC stdio 传输与调度原语"]
         Codex["packages/runtime/codex\ncodex app-server JSON-RPC"]
         ACP["packages/runtime/acp\n通用 ACP stdio JSON-RPC"]
+        Shared --> Codex
+        Shared --> ACP
     end
 
     Plugin["packages/plugin\n薄 DSH Host 插件\nAgentLoop 包装 + ExternalRuntimeRegistry"]
@@ -23,6 +26,7 @@ flowchart LR
 
 | 模块路径 | 包名 | 职责与边界 |
 | --- | --- | --- |
+| `packages/runtime/shared-stdio` | `@dsh-external-agents/runtime-shared-stdio` | 零外部依赖的共享 JSON-RPC stdio 传输基类（EPIPE 防护、单实例 `terminateChild()`、行缓冲与超时清理）、`JsonRpcDispatcher` 请求调度与环境/路径清洗原语（**零 DSH 依赖**） |
 | `packages/runtime/codex` | `@dsh-external-agents/runtime-codex` | 纯 TS `codex app-server` JSON-RPC 客户端（**零 DSH 依赖**） |
 | `packages/runtime/acp` | `@dsh-external-agents/runtime-acp` | 纯 TS 通用 ACP（Agent Client Protocol）stdio JSON-RPC 客户端，支持能力协商与 `session/resume` → `session/load` → `session/new` 自动回退（**零 DSH 依赖**） |
 | `packages/plugin` | `@dsh-external-agents/plugin` | 薄 DSH Host 插件：包装 `AgentLoop`、通过 `ExternalRuntimeRegistry` 统一管理可插拔外部运行时与启动配置、映射流式事件/工具调用/审批/提问并发布 `ctx.externalRuntimes` |

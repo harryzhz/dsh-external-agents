@@ -1,16 +1,21 @@
 import { basename } from 'node:path'
+import { JsonRpcDispatcher } from '@dsh-external-agents/runtime-shared-stdio'
 import {
   extractCodexTokenUsage,
   normalizeCodexApprovalRequest,
   normalizeCodexNotification,
   normalizeCodexUserInputRequest,
 } from './event-normalizer.js'
+import {
+  extractCodexNotificationThreadId,
+  mapApprovalResponse,
+  parseModelList,
+  sandboxPolicyForTurn,
+} from './protocol-helpers.js'
 import { CodexStdioTransport, resolveSafeCwd } from './stdio-transport.js'
 import type {
-  CodexApprovalDecision,
   CodexModelInfo,
   CodexRuntimeOptions,
-  CodexSandboxMode,
   CodexStartOptions,
   CodexTokenUsage,
   CodexTransportFactoryOptions,
@@ -52,13 +57,6 @@ export function isThreadNotFoundError(err: unknown): boolean {
   return THREAD_NOT_FOUND_RE.test(message)
 }
 
-interface PendingRequest {
-  readonly method: string
-  readonly resolve: (result: unknown) => void
-  readonly reject: (error: Error) => void
-  timer: ReturnType<typeof setTimeout>
-}
-
 interface ActiveTurnState {
   nativeTurnId?: string
   cancelRequested?: boolean
@@ -69,125 +67,6 @@ interface ActiveTurnState {
   readonly abortController: AbortController
   readonly settle: (result: CodexTurnResult) => void
   readonly fail: (error: Error) => void
-}
-
-function extractCodexNotificationThreadId(params: unknown): string | undefined {
-  if (!params || typeof params !== 'object') return undefined
-  const rec = params as Record<string, unknown>
-  const direct =
-    typeof rec.threadId === 'string'
-      ? rec.threadId
-      : typeof rec.thread_id === 'string'
-        ? rec.thread_id
-        : undefined
-  if (direct?.trim()) return direct.trim()
-  const turn =
-    rec.turn && typeof rec.turn === 'object' ? (rec.turn as Record<string, unknown>) : undefined
-  if (typeof turn?.threadId === 'string' && turn.threadId.trim()) return turn.threadId.trim()
-  if (typeof turn?.thread_id === 'string' && turn.thread_id.trim()) return turn.thread_id.trim()
-  const thread =
-    rec.thread && typeof rec.thread === 'object'
-      ? (rec.thread as Record<string, unknown>)
-      : undefined
-  if (typeof thread?.id === 'string' && thread.id.trim()) return thread.id.trim()
-  return undefined
-}
-
-function sandboxPolicyForTurn(sandbox?: CodexSandboxMode): Record<string, unknown> | undefined {
-  if (sandbox === 'danger-full-access') return { type: 'dangerFullAccess' }
-  if (sandbox === 'workspace-write') return { type: 'workspaceWrite' }
-  if (sandbox === 'read-only') return { type: 'readOnly' }
-  return undefined
-}
-
-function mapApprovalResponse(method: string, decision: CodexApprovalDecision): unknown {
-  if (method === 'execCommandApproval' || method === 'applyPatchApproval') {
-    if (decision === 'allow-session') return { decision: 'approved_for_session' }
-    if (decision === 'allow-once') return { decision: 'approved' }
-    return { decision: 'denied' }
-  }
-  if (method === 'item/permissions/requestApproval') {
-    return decision === 'reject'
-      ? { permissions: {}, scope: 'turn', decision: 'decline' }
-      : { permissions: {}, scope: 'turn' }
-  }
-  if (decision === 'allow-session') return { decision: 'acceptForSession' }
-  if (decision === 'allow-once') return { decision: 'accept' }
-  return { decision: 'decline' }
-}
-
-function parseModelList(result: unknown): { models: CodexModelInfo[]; nextCursor?: string } {
-  const record = result && typeof result === 'object' ? (result as Record<string, unknown>) : {}
-  const data = Array.isArray(record.data)
-    ? record.data
-    : Array.isArray(record.models)
-      ? record.models
-      : []
-  const models: CodexModelInfo[] = []
-  for (const raw of data) {
-    if (!raw || typeof raw !== 'object') continue
-    const item = raw as Record<string, unknown>
-    if (item.hidden === true || item.visibility === 'hidden') continue
-    const id =
-      typeof item.id === 'string' && item.id
-        ? item.id
-        : typeof item.model === 'string' && item.model
-          ? item.model
-          : typeof item.slug === 'string' && item.slug
-            ? item.slug
-            : ''
-    if (!id) continue
-    const name =
-      typeof item.displayName === 'string' && item.displayName.trim()
-        ? item.displayName.trim()
-        : typeof item.name === 'string' && item.name.trim()
-          ? item.name.trim()
-          : id
-    const rawEfforts = Array.isArray(item.supportedReasoningEfforts)
-      ? item.supportedReasoningEfforts
-      : Array.isArray(item.supported_reasoning_levels)
-        ? item.supported_reasoning_levels
-        : undefined
-    const supportedReasoningEfforts = (rawEfforts ?? [])
-      .map((entry) => {
-        if (typeof entry === 'string') return entry
-        if (entry && typeof entry === 'object') {
-          const rec = entry as Record<string, unknown>
-          if (typeof rec.reasoningEffort === 'string') return rec.reasoningEffort
-          if (typeof rec.effort === 'string') return rec.effort
-        }
-        return ''
-      })
-      .filter((v) => v.length > 0)
-    const defaultReasoningEffort =
-      typeof item.defaultReasoningEffort === 'string' && item.defaultReasoningEffort.length > 0
-        ? item.defaultReasoningEffort
-        : typeof item.default_reasoning_level === 'string' && item.default_reasoning_level.length > 0
-          ? item.default_reasoning_level
-          : undefined
-    const rawWindow =
-      typeof item.contextWindow === 'number'
-        ? item.contextWindow
-        : typeof item.context_window === 'number'
-          ? item.context_window
-          : undefined
-    const contextWindow =
-      rawWindow !== undefined && Number.isFinite(rawWindow) && rawWindow > 0 ? rawWindow : undefined
-    models.push({
-      id,
-      name,
-      supportedReasoningEfforts,
-      ...(rawEfforts !== undefined ? { reasoningEffortsDeclared: true } : {}),
-      ...(defaultReasoningEffort ? { defaultReasoningEffort } : {}),
-      ...(contextWindow ? { contextWindow } : {}),
-      ...(item.isDefault === true ? { isDefault: true } : {}),
-    })
-  }
-  const nextCursor =
-    typeof record.nextCursor === 'string' && record.nextCursor.length > 0
-      ? record.nextCursor
-      : undefined
-  return { models, ...(nextCursor ? { nextCursor } : {}) }
 }
 
 export class CodexRuntimeClient {
@@ -201,15 +80,13 @@ export class CodexRuntimeClient {
   private readonly clientVersion: string
   private readonly logger: (message: string) => void
   private readonly transportFactory: (options: CodexTransportFactoryOptions) => JsonRpcTransport
+  private readonly dispatcher: JsonRpcDispatcher
 
-  private transport?: JsonRpcTransport
-  private nextId = 1
   private initialized = false
   private closed = false
   private currentThreadId?: string
   private pendingTurnSelection?: { readonly model?: string; readonly reasoningEffort?: string }
   private activeTurn?: ActiveTurnState
-  private readonly pending = new Map<number, PendingRequest>()
 
   constructor(options: CodexRuntimeOptions) {
     this.cwd = resolveSafeCwd(options.cwd)
@@ -222,6 +99,11 @@ export class CodexRuntimeClient {
     this.clientVersion = options.clientVersion ?? '0.1.0'
     this.logger = options.logger ?? (() => {})
     this.transportFactory = options.transportFactory ?? ((opts) => new CodexStdioTransport(opts))
+    this.dispatcher = new JsonRpcDispatcher({
+      label: this.label,
+      defaultTimeoutMs: this.requestTimeoutMs,
+      createRpcError: (method, error) => new CodexRpcError(method, error),
+    })
   }
 
   get threadId(): string | undefined {
@@ -229,11 +111,11 @@ export class CodexRuntimeClient {
   }
 
   get isConnected(): boolean {
-    return Boolean(this.transport && this.initialized && !this.closed)
+    return Boolean(this.dispatcher.activeTransport && this.initialized && !this.closed)
   }
 
   async initialize(): Promise<void> {
-    if (this.initialized && this.transport && !this.closed) return
+    if (this.initialized && this.dispatcher.activeTransport && !this.closed) return
     this.closed = false
     const transport = this.transportFactory({
       cliBin: this.cliBin,
@@ -241,7 +123,7 @@ export class CodexRuntimeClient {
       cwd: this.cwd,
       env: this.env,
     })
-    this.transport = transport
+    this.dispatcher.attach(transport)
     transport.onMessage((msg) => this.handleMessage(msg))
     transport.onClose((err) => this.handleTransportClosed(transport, err))
 
@@ -250,11 +132,10 @@ export class CodexRuntimeClient {
         clientInfo: { name: this.clientName, version: this.clientVersion },
         capabilities: { experimentalApi: true },
       })
-      this.notify('initialized', {})
+      this.dispatcher.notify('initialized', {}, false)
       this.initialized = true
     } catch (err) {
-      if (this.transport === transport) {
-        this.transport = undefined
+      if (this.dispatcher.detach(transport)) {
         this.initialized = false
       }
       await transport.close().catch(() => {})
@@ -472,8 +353,7 @@ export class CodexRuntimeClient {
   async close(): Promise<void> {
     if (this.closed) return
     this.closed = true
-    const transport = this.transport
-    this.transport = undefined
+    const transport = this.dispatcher.detach()
     this.initialized = false
     this.pendingTurnSelection = undefined
     this.failInflight(new Error(`${this.label} runtime closed`))
@@ -492,52 +372,14 @@ export class CodexRuntimeClient {
   }
 
   private request(method: string, params: unknown): Promise<unknown> {
-    if (!this.transport || this.closed) {
+    if (this.closed) {
       return Promise.reject(new Error(`cannot send ${this.label} RPC "${method}": transport closed`))
     }
-    const id = this.nextId++
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        if (!this.pending.delete(id)) return
-        reject(new Error(`${this.label} RPC "${method}" timed out after ${this.requestTimeoutMs}ms`))
-      }, this.requestTimeoutMs)
-      timer.unref?.()
-      this.pending.set(id, { method, resolve, reject, timer })
-      try {
-        this.transport!.send({ jsonrpc: '2.0', id, method, params })
-      } catch (err) {
-        clearTimeout(timer)
-        this.pending.delete(id)
-        reject(err instanceof Error ? err : new Error(String(err)))
-      }
-    })
-  }
-
-  private notify(method: string, params: unknown): void {
-    this.transport?.send({ jsonrpc: '2.0', method, params })
-  }
-
-  private respond(id: number | string, result: unknown): void {
-    try {
-      this.transport?.send({ jsonrpc: '2.0', id, result })
-    } catch {
-      // Transport closed while preparing response.
-    }
+    return this.dispatcher.request(method, params)
   }
 
   private handleMessage(msg: JsonRpcMessage): void {
-    if (typeof msg.id === 'number' && !msg.method) {
-      const pending = this.pending.get(msg.id)
-      if (!pending) return
-      this.pending.delete(msg.id)
-      clearTimeout(pending.timer)
-      if (msg.error) {
-        pending.reject(new CodexRpcError(pending.method, msg.error))
-      } else {
-        pending.resolve(msg.result)
-      }
-      return
-    }
+    if (this.dispatcher.handleResponse(msg)) return
 
     if (msg.id !== undefined && typeof msg.method === 'string') {
       void this.handleServerRequest(msg.id, msg.method, msg.params)
@@ -560,11 +402,11 @@ export class CodexRuntimeClient {
         `${this.label} declining server request "${method}" for foreign thread ${incomingThreadId} (current=${this.currentThreadId})`,
       )
       if (method === 'item/tool/requestUserInput') {
-        this.respond(id, { answers: {} })
+        this.dispatcher.respond(id, { answers: {} })
       } else if (method === 'mcpServer/elicitation/request') {
-        this.respond(id, { action: 'cancel', content: null, _meta: null })
+        this.dispatcher.respond(id, { action: 'cancel', content: null, _meta: null })
       } else {
-        this.respond(id, mapApprovalResponse(method, 'reject'))
+        this.dispatcher.respond(id, mapApprovalResponse(method, 'reject'))
       }
       return
     }
@@ -575,13 +417,13 @@ export class CodexRuntimeClient {
     if (method === 'item/tool/requestUserInput') {
       const handler = turn?.handlers.onUserInput
       if (!handler) {
-        this.respond(id, { answers: {} })
+        this.dispatcher.respond(id, { answers: {} })
         return
       }
       try {
         const answer = await handler(normalizeCodexUserInputRequest(params), signal)
         if (!signal.aborted && !this.closed) {
-          this.respond(id, answer)
+          this.dispatcher.respond(id, answer)
         }
       } catch (err) {
         this.logger(
@@ -593,24 +435,24 @@ export class CodexRuntimeClient {
     }
 
     if (method === 'mcpServer/elicitation/request') {
-      this.respond(id, { action: 'cancel', content: null, _meta: null })
+      this.dispatcher.respond(id, { action: 'cancel', content: null, _meta: null })
       return
     }
 
     const approvalHandler = turn?.handlers.onApproval
     if (!approvalHandler) {
-      this.respond(id, mapApprovalResponse(method, 'allow-session'))
+      this.dispatcher.respond(id, mapApprovalResponse(method, 'allow-session'))
       return
     }
 
     try {
       const decision = await approvalHandler(normalizeCodexApprovalRequest(method, params), signal)
       if (!signal.aborted && !this.closed) {
-        this.respond(id, mapApprovalResponse(method, decision))
+        this.dispatcher.respond(id, mapApprovalResponse(method, decision))
       }
     } catch {
       if (!this.closed) {
-        this.respond(id, mapApprovalResponse(method, 'reject'))
+        this.dispatcher.respond(id, mapApprovalResponse(method, 'reject'))
       }
     }
   }
@@ -724,19 +566,14 @@ export class CodexRuntimeClient {
   }
 
   private handleTransportClosed(closedTransport: JsonRpcTransport, error?: Error): void {
-    if (this.transport !== closedTransport) return
+    if (!this.dispatcher.detach(closedTransport)) return
     this.initialized = false
-    this.transport = undefined
     this.pendingTurnSelection = undefined
     this.failInflight(error ?? new Error('codex app-server transport closed'))
   }
 
   private failInflight(error: Error): void {
-    for (const [id, pending] of this.pending) {
-      clearTimeout(pending.timer)
-      this.pending.delete(id)
-      pending.reject(error)
-    }
+    this.dispatcher.failAll(error)
     if (this.activeTurn) {
       const turn = this.activeTurn
       this.activeTurn = undefined

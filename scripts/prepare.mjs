@@ -26,10 +26,11 @@ export async function buildExternalAgentsBundle() {
     name: 'workspace-source-aliases',
     setup(buildApi) {
       const aliases = new Map([
+        ['@dsh-external-agents/runtime-shared-stdio', resolve(repoRoot, 'packages/runtime/shared-stdio/src/index.ts')],
         ['@dsh-external-agents/runtime-codex', resolve(repoRoot, 'packages/runtime/codex/src/index.ts')],
         ['@dsh-external-agents/runtime-acp', resolve(repoRoot, 'packages/runtime/acp/src/index.ts')],
       ])
-      buildApi.onResolve({ filter: /^@dsh-external-agents\/runtime-(?:codex|acp)$/ }, (args) => {
+      buildApi.onResolve({ filter: /^@dsh-external-agents\/runtime-(?:shared-stdio|codex|acp)$/ }, (args) => {
         const target = aliases.get(args.path)
         return target ? { path: target } : null
       })

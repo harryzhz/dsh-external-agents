@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 // @ts-expect-error ESM release script outside tsconfig root
 import {
+  VERSIONED_PACKAGE_PATHS,
   applyVersionToPackages,
   computeReleasePlan,
   isShippablePath,
@@ -12,7 +13,9 @@ import {
 describe('release-plan auto-release logic', () => {
   it('classifies shippable runtime/plugin files vs docs/CI/test-only files', () => {
     expect(isShippablePath('packages/plugin/src/index.ts')).toBe(true)
+    expect(isShippablePath('packages/runtime/shared-stdio/src/stdio-transport.ts')).toBe(true)
     expect(isShippablePath('packages/runtime/acp/src/client.ts')).toBe(true)
+    expect(VERSIONED_PACKAGE_PATHS).toContain('packages/runtime/shared-stdio/package.json')
     expect(isShippablePath('package.json')).toBe(true)
     expect(isShippablePath('cordis.patch.yml')).toBe(true)
 

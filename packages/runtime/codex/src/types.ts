@@ -130,18 +130,6 @@ export interface CodexTransportFactoryOptions {
   readonly env: NodeJS.ProcessEnv
 }
 
-export interface JsonRpcMessage {
-  readonly jsonrpc?: string
-  readonly id?: number | string
-  readonly method?: string
-  readonly params?: unknown
-  readonly result?: unknown
-  readonly error?: { readonly code?: number; readonly message?: string; readonly data?: unknown }
-}
+import type { JsonRpcMessage, JsonRpcTransport } from '@dsh-external-agents/runtime-shared-stdio'
 
-export interface JsonRpcTransport {
-  send(message: JsonRpcMessage): void
-  onMessage(listener: (message: JsonRpcMessage) => void): () => void
-  onClose(listener: (error?: Error) => void): () => void
-  close(): Promise<void>
-}
+export type { JsonRpcMessage, JsonRpcTransport }

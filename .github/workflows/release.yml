@@ -82,7 +82,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add package.json packages/plugin/package.json packages/runtime/acp/package.json packages/runtime/codex/package.json
+          git add package.json packages/plugin/package.json packages/runtime/shared-stdio/package.json packages/runtime/acp/package.json packages/runtime/codex/package.json
           if ! git diff --cached --quiet; then
             git commit -m "chore(release): ${RELEASE_TAG} [skip ci]"
             git push origin HEAD:main
