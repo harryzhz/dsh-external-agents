@@ -23,6 +23,7 @@ export class CodexStdioTransport implements JsonRpcTransport {
   private readonly closeListeners = new Set<(error?: Error) => void>()
   private stderrTail = ''
   private closed = false
+  private closePromise?: Promise<void>
 
   constructor(options: CodexTransportFactoryOptions) {
     const safeCwd = resolveSafeCwd(options.cwd)
@@ -101,42 +102,49 @@ export class CodexStdioTransport implements JsonRpcTransport {
   }
 
   async close(): Promise<void> {
-    if (this.closed) return
     this.closed = true
     this.rl.close()
-    try {
-      this.child.stdin?.end()
-    } catch {
-      // Pipe already closed.
-    }
-    if (this.child.exitCode !== null || this.child.signalCode !== null) {
-      this.notifyClosed(undefined)
-      return
-    }
-    await new Promise<void>((resolve) => {
-      let settled = false
-      const done = () => {
-        if (settled) return
-        settled = true
-        clearTimeout(timer)
-        resolve()
-      }
-      const timer = setTimeout(() => {
-        try {
-          this.child.kill('SIGKILL')
-        } catch {
-          // Process already exited.
-        }
-        done()
-      }, KILL_GRACE_MS)
-      timer.unref?.()
-      this.child.once('exit', done)
+    await this.terminateChild()
+    this.notifyClosed(undefined)
+  }
+
+  private terminateChild(): Promise<void> {
+    if (this.closePromise) return this.closePromise
+    this.closePromise = (async () => {
       try {
-        this.child.kill('SIGTERM')
+        this.child.stdin?.end()
       } catch {
-        done()
+        // Pipe already closed.
       }
-    })
+      if (this.child.exitCode !== null || this.child.signalCode !== null) {
+        return
+      }
+      await new Promise<void>((resolve) => {
+        let settled = false
+        const done = () => {
+          if (settled) return
+          settled = true
+          clearTimeout(timer)
+          resolve()
+        }
+        const timer = setTimeout(() => {
+          try {
+            this.child.kill('SIGKILL')
+          } catch {
+            // Process already exited.
+          }
+          done()
+        }, KILL_GRACE_MS)
+        timer.unref?.()
+        this.child.once('exit', done)
+        try {
+          this.child.kill('SIGTERM')
+        } catch {
+          done()
+        }
+      })
+    })()
+    return this.closePromise
   }
 
   private handleLine(line: string): void {
@@ -162,6 +170,9 @@ export class CodexStdioTransport implements JsonRpcTransport {
   private notifyClosed(error?: Error): void {
     this.closed = true
     this.rl.close()
+    if (this.child.exitCode === null && this.child.signalCode === null) {
+      void this.terminateChild()
+    }
     for (const listener of [...this.closeListeners]) {
       try {
         listener(error)
