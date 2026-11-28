@@ -278,6 +278,8 @@ interface PoolEntry {
   idleTimer?: ReturnType<typeof setTimeout>
   retired: boolean
   closing?: Promise<void>
+  drainPromise?: Promise<void>
+  resolveDrain?: () => void
 }
 
 /**
@@ -335,6 +337,11 @@ export class AcpRuntimePool {
 
     try {
       const handle = await entry.client.openSession(startOptions)
+      if (this.disposed) {
+        await handle.close().catch(() => {})
+        this.onSessionReleased(entry)
+        throw new Error(`ACP pool for "${this.spec.id}" has been disposed`)
+      }
       let released = false
       return {
         handle,
@@ -394,6 +401,8 @@ export class AcpRuntimePool {
     this.clearIdleTimer(entry)
     if (entry.client.activeSessionCount === 0 && entry.client.inFlightTurnCount === 0) {
       await this.closeEntry(entry)
+    } else {
+      this.ensureDrainPromise(entry)
     }
   }
 
@@ -410,21 +419,48 @@ export class AcpRuntimePool {
     )
   }
 
+  private ensureDrainPromise(entry: PoolEntry): Promise<void> {
+    if (!entry.drainPromise) {
+      entry.drainPromise = new Promise<void>((resolve) => {
+        entry.resolveDrain = resolve
+      })
+    }
+    return entry.drainPromise
+  }
+
   private async acquireEntry(
     key: string,
     profile: ExternalRuntimeProfile | undefined,
     logger?: (message: string) => void,
   ): Promise<PoolEntry> {
-    while (this.retiring.has(key)) {
-      await this.retiring.get(key)?.catch(() => {})
+    while (true) {
+      if (this.disposed) {
+        throw new Error(`ACP pool for "${this.spec.id}" has been disposed`)
+      }
+      const retiringTask = this.retiring.get(key)
+      if (retiringTask) {
+        await retiringTask.catch(() => {})
+        continue
+      }
+
+      const existing = this.entries.get(key)
+      if (!existing) break
+      if (!existing.retired && !existing.closing) {
+        return existing
+      }
+      if (existing.closing) {
+        await existing.closing.catch(() => {})
+        continue
+      }
+      if (existing.client.activeSessionCount > 0 || existing.client.inFlightTurnCount > 0) {
+        await this.ensureDrainPromise(existing).catch(() => {})
+        continue
+      }
+      await this.closeEntry(existing)
     }
 
-    const existing = this.entries.get(key)
-    if (existing && !existing.retired && !existing.closing) {
-      return existing
-    }
-    if (existing) {
-      await this.closeEntry(existing)
+    if (this.disposed) {
+      throw new Error(`ACP pool for "${this.spec.id}" has been disposed`)
     }
 
     const { runtimeOptions, agyIsolation } = this.buildRuntimeOptions(profile, {
@@ -544,6 +580,8 @@ export class AcpRuntimePool {
         if (this.retiring.get(entry.key) === task) {
           this.retiring.delete(entry.key)
         }
+        entry.resolveDrain?.()
+        entry.resolveDrain = undefined
       })
     entry.closing = task
     this.retiring.set(entry.key, task)

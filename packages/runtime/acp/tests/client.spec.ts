@@ -1536,7 +1536,15 @@ describe('AcpRuntimeClient prompt idle timeout', () => {
     const closedErrors: Array<Error | undefined> = []
     transport.onClose((err) => closedErrors.push(err))
 
-    const child = (transport as unknown as { child: { stdin: { emit: (ev: string, err: Error) => void } } }).child
+    const child = (
+      transport as unknown as {
+        child: {
+          exitCode: number | null
+          signalCode: NodeJS.Signals | null
+          stdin: { emit: (ev: string, err: Error) => void }
+        }
+      }
+    ).child
     const epipe = Object.assign(new Error('write EPIPE'), { code: 'EPIPE' })
     child.stdin.emit('error', epipe)
 
@@ -1544,6 +1552,7 @@ describe('AcpRuntimeClient prompt idle timeout', () => {
     expect(closedErrors[0]?.message).toContain('stdin error: write EPIPE')
     expect(() => transport.send({ jsonrpc: '2.0', method: 'ping' })).toThrow(/transport is closed/)
     await transport.close()
+    expect(child.exitCode !== null || child.signalCode !== null).toBe(true)
   })
 
   it('closes transport when initialize fails and ignores stale close events from prior transports', async () => {

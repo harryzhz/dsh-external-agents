@@ -547,4 +547,93 @@ describe('AcpRuntimePool isolation, multiplexing, probe reuse, and lifecycle', (
       else process.env.ANTIGRAVITY_TRAJECTORY_ID = prevAgyTraj
     }
   })
+
+  it('waits for retired pooled client to drain active sessions instead of killing in-flight turns', async () => {
+    const fakeHome = makeTempDir('agy-retire-drain-home-')
+    const agySpec = resolveRuntimeSpecs([{ id: 'agy', env: { HOME: fakeHome } }]).find((s) => s.id === 'agy')!
+    const createdClients: FakePoolClient[] = []
+    const pool = new AcpRuntimePool({
+      spec: agySpec,
+      instanceScopeKey: '/tmp/dsh-retire-drain/external-agents',
+      idleEvictMs: 0,
+      clientFactory: (opts) => {
+        const c = new FakePoolClient(opts)
+        createdClients.push(c)
+        return c
+      },
+    })
+
+    const s1 = await pool.openSession(undefined, { cwd: '/workspace/a' })
+    expect(createdClients).toHaveLength(1)
+
+    await pool.invalidateProfile(undefined)
+    expect(createdClients[0]!.closed).toBe(false)
+
+    // A concurrent openSession must NOT forcibly close the active retired client
+    let s2Resolved = false
+    const s2Promise = pool.openSession(undefined, { cwd: '/workspace/b' }).then((res) => {
+      s2Resolved = true
+      return res
+    })
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(createdClients[0]!.closed).toBe(false)
+    expect(createdClients).toHaveLength(1)
+    expect(s2Resolved).toBe(false)
+
+    // Once s1 finishes and releases, the retired client closes cleanly and s2 spawns a fresh replacement
+    await s1.release()
+    const s2 = await s2Promise
+    expect(createdClients[0]!.closed).toBe(true)
+    expect(createdClients).toHaveLength(2)
+    expect(createdClients[1]!.closed).toBe(false)
+
+    await s2.release()
+    await pool.disposeAll()
+  })
+
+  it('does not spawn orphan pooled clients when disposeAll runs while openSession waits for retirement', async () => {
+    const fakeHome = makeTempDir('agy-dispose-race-home-')
+    const agySpec = resolveRuntimeSpecs([{ id: 'agy', env: { HOME: fakeHome } }]).find((s) => s.id === 'agy')!
+    const createdClients: FakePoolClient[] = []
+    let releaseClose!: () => void
+    const closeGate = new Promise<void>((resolve) => {
+      releaseClose = resolve
+    })
+
+    const pool = new AcpRuntimePool({
+      spec: agySpec,
+      instanceScopeKey: '/tmp/dsh-dispose-race/external-agents',
+      idleEvictMs: 0,
+      clientFactory: (opts) => {
+        const c = new FakePoolClient(opts)
+        if (createdClients.length === 0) {
+          const origClose = c.close.bind(c)
+          c.close = async () => {
+            await closeGate
+            await origClose()
+          }
+        }
+        createdClients.push(c)
+        return c
+      },
+    })
+
+    const s1 = await pool.openSession(undefined, { cwd: '/workspace/a' })
+    await s1.release()
+
+    // Start retiring the idle client; close() pauses on closeGate
+    const invalidatePromise = pool.invalidateProfile(undefined)
+    // Concurrently request a new session (blocks on this.retiring)
+    const waitingOpen = pool.openSession(undefined, { cwd: '/workspace/b' })
+    // Dispose the entire pool while waitingOpen is blocked
+    const disposePromise = pool.disposeAll()
+
+    releaseClose()
+    await expect(waitingOpen).rejects.toThrow(/has been disposed/)
+    await Promise.all([invalidatePromise, disposePromise])
+    // Only the initial client was ever created — no orphan spawned post-dispose
+    expect(createdClients).toHaveLength(1)
+    expect(createdClients[0]!.closed).toBe(true)
+  })
 })
