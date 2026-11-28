@@ -218,24 +218,12 @@ export interface AcpRuntimeOptions {
   readonly transportFactory?: (options: AcpTransportFactoryOptions) => AcpJsonRpcTransport
 }
 
-export interface AcpJsonRpcError {
-  readonly code?: number
-  readonly message?: string
-  readonly data?: unknown
-}
+import type {
+  JsonRpcError,
+  JsonRpcMessage,
+  JsonRpcTransport,
+} from '@dsh-external-agents/runtime-shared-stdio'
 
-export interface AcpJsonRpcMessage {
-  readonly jsonrpc?: string
-  readonly id?: number | string
-  readonly method?: string
-  readonly params?: unknown
-  readonly result?: unknown
-  readonly error?: AcpJsonRpcError
-}
-
-export interface AcpJsonRpcTransport {
-  send(message: AcpJsonRpcMessage): void
-  onMessage(listener: (message: AcpJsonRpcMessage) => void): () => void
-  onClose(listener: (error?: Error) => void): () => void
-  close(): Promise<void>
-}
+export type AcpJsonRpcError = JsonRpcError
+export type AcpJsonRpcMessage = JsonRpcMessage
+export type AcpJsonRpcTransport = JsonRpcTransport

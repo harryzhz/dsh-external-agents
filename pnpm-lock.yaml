@@ -92,9 +92,19 @@ importers:
         specifier: 3.19.0
         version: 3.19.0
 
-  packages/runtime/acp: {}
+  packages/runtime/acp:
+    dependencies:
+      '@dsh-external-agents/runtime-shared-stdio':
+        specifier: file:../shared-stdio
+        version: link:../shared-stdio
 
-  packages/runtime/codex: {}
+  packages/runtime/codex:
+    dependencies:
+      '@dsh-external-agents/runtime-shared-stdio':
+        specifier: file:../shared-stdio
+        version: link:../shared-stdio
+
+  packages/runtime/shared-stdio: {}
 
 packages:
 

@@ -14,6 +14,7 @@ import { fileURLToPath } from 'node:url'
 export const VERSIONED_PACKAGE_PATHS = [
   'package.json',
   'packages/plugin/package.json',
+  'packages/runtime/shared-stdio/package.json',
   'packages/runtime/acp/package.json',
   'packages/runtime/codex/package.json',
 ]
